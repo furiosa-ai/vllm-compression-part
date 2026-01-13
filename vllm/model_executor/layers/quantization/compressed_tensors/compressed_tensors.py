@@ -29,7 +29,7 @@ from vllm.model_executor.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsW4A8Fp8, CompressedTensorsW4A8Int,
     CompressedTensorsW4A16Fp4, CompressedTensorsW4A16Sparse24,
     CompressedTensorsW8A8Fp8, CompressedTensorsW8A8Int8,
-    CompressedTensorsW8A16Fp8, CompressedTensorsWNA16, CompressedTensorsW8A8MXFp8)
+    CompressedTensorsW8A16Fp8, CompressedTensorsWNA16, CompressedTensorsW8A8MXFp8, CompressedTensorsW8A8MXFp8Plus)
 from vllm.model_executor.layers.quantization.compressed_tensors.transform.linear import (  # noqa: E501
     CompressedTensorsLinearTransformMethod, get_linear_transform_schemes)
 from vllm.model_executor.layers.quantization.compressed_tensors.utils import (
@@ -325,6 +325,27 @@ class CompressedTensorsConfig(QuantizationConfig):
 
         return (is_tensor_group_quant and is_float_type and is_8_bits
                 and is_group_size_32 and is_symmetric and is_microscaling)
+        
+    def _is_fp8a8_mxfp8_plus(self, weight_quant: QuantizationArgs,
+                         input_quant: QuantizationArgs):
+
+        if weight_quant is None or input_quant is None:
+            return False
+
+        is_tensor_group_quant = (weight_quant.strategy
+                                 == QuantizationStrategy.GROUP.value
+                                 and input_quant.strategy
+                                 == QuantizationStrategy.GROUP.value)
+        is_symmetric = weight_quant.symmetric and input_quant.symmetric
+
+        is_group_size_32 = (weight_quant.group_size == 32
+                            and input_quant.group_size == 32)
+        is_float_type = (weight_quant.type == QuantizationType.FLOAT
+                         and input_quant.type == QuantizationType.FLOAT.value)
+        is_8_bits = weight_quant.num_bits == 8 and input_quant.num_bits == 8
+        
+        return (is_tensor_group_quant and is_float_type and is_8_bits
+                and is_group_size_32 and is_symmetric)
 
     def _is_static_tensor_w8a8(self, weight_quant: QuantizationArgs,
                                input_quant: QuantizationArgs) -> bool:
@@ -491,6 +512,12 @@ class CompressedTensorsConfig(QuantizationConfig):
                     "Current mxfp8 does not support native MXFP8."
                     "Running MXFP8 EmulationMode")
             return CompressedTensorsW8A8MXFp8()
+        
+        if self._is_fp8a8_mxfp8_plus(weight_quant, input_quant):
+            logger.warning_once(
+                    "Current mxfp8_plus does not support native MXFP8_PLUS."
+                    "Running MXFP8_PLUS EmulationMode")
+            return CompressedTensorsW8A8MXFp8Plus(weight_quant=weight_quant, input_quant=input_quant)
 
         if self._is_wNa16_group_channel(weight_quant, input_quant):
             if (format == CompressionFormat.marlin_24.value
