@@ -9,9 +9,7 @@ from vllm.model_executor.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsScheme)
 from compressed_tensors_furiosa_extension.kernels import custom_extensions as extensions
 from compressed_tensors.quantization.utils import compute_dynamic_scales_and_zp
-from compressed_tensors_furiosa_extension.quantization.quant_scheme import (
-    create_mxfp8_scheme,
-)
+
 from compressed_tensors.quantization import QuantizationArgs, QuantizationType, QuantizationStrategy
 from compressed_tensors.quantization.lifecycle.forward import (
     fake_quantize,
@@ -25,20 +23,42 @@ logger = init_logger(__name__)
 
 __all__ = ["CompressedTensorsW8A8MXFp8Plus"]
 
+torch.library.define(
+    "furiosa::quantize_mxfp8_plus",
+    "(Tensor input, int group_size, int axis, int rounding_mode) -> Tensor",
+    tags=torch.Tag.pt2_compliant_tag,
+)
 
-def fake_quantize_mxfp8_plus(
+@torch.library.impl("furiosa::quantize_mxfp8_plus", "cuda")
+def quantize_mxfp8_plus_cuda(
     input: torch.Tensor,
     group_size: int = 32,
-    ebits: int = 4,
-    mbits: int = 5,
-    max_norm: float = 448.0,
-    scale_bits: int = 8,
     axis: int = -1,
-    flush_fp32_subnorms: bool = False,
     rounding_mode: int = 2,
-    quantization_args: QuantizationArgs = None,
 ) -> torch.Tensor:
-    
+    input_contig = input.contiguous() if not input.is_contiguous() else input
+    return extensions.quantize_mxfp8_plus_by_tile_func_cuda(
+        input_contig, group_size, axis, rounding_mode
+    )
+
+@torch.library.register_fake("furiosa::quantize_mxfp8_plus")
+def quantize_mxfp8_plus_fake(
+    input: torch.Tensor,
+    group_size: int = 32,
+    axis: int = -1,
+    rounding_mode: int = 2,
+) -> torch.Tensor:
+    return torch.empty_like(input)
+
+@torch.library.impl("furiosa::quantize_mxfp8_plus", "cpu")
+def quantize_mxfp8_plus_cpu(
+    input: torch.Tensor,
+    rounding_mode: int = 2,
+    group_size: int = 32,
+    axis: int = -1,
+) -> torch.Tensor:
+    from compressed_tensors_furiosa_extension.quantization.quant_scheme import create_mxfp8_plus_scheme
+    quantization_args = create_mxfp8_plus_scheme().input_activations
     scale, zero_point = compute_dynamic_scales_and_zp(
         value=input, args=quantization_args, module=None, global_scale=None
     )
@@ -54,18 +74,22 @@ def fake_quantize_mxfp8_plus(
     
     return mxfp8_qdq_input.to(input.dtype)
 
+def fake_quantize_mxfp8_plus(
+    input: torch.Tensor,
+    group_size: int = 32,
+    axis: int = -1,
+    rounding_mode: int = 2,
+) -> torch.Tensor:
+    
+    return torch.ops.furiosa.quantize_mxfp8_plus(
+        input, group_size, axis, rounding_mode
+    )
+
 
 class CompressedTensorsW8A8MXFp8Plus(CompressedTensorsScheme):
 
-    def __init__(self, weight_quant: QuantizationArgs,
-                 input_quant: QuantizationArgs):
+    def __init__(self):
         self.group_size = 32
-        self.ebits = 4
-        self.mbits = 5
-        self.max_norm = 448.0
-        self.scale_bits = 16
-        self.weight_quant = weight_quant
-        self.input_quant = input_quant
 
     @classmethod
     def get_min_capability(cls) -> int:
@@ -123,14 +147,8 @@ class CompressedTensorsW8A8MXFp8Plus(CompressedTensorsScheme):
         qdq_input = fake_quantize_mxfp8_plus(
             input=x,
             group_size=self.group_size,
-            ebits=self.ebits,
-            mbits=self.mbits,
-            max_norm=self.max_norm,
-            scale_bits=self.scale_bits,
             axis=axis,
-            flush_fp32_subnorms=False,
             rounding_mode=2,  # rd_away
-            quantization_args=self.input_quant
         )
         
         dq_weight = layer.weight.to(qdq_input.dtype)

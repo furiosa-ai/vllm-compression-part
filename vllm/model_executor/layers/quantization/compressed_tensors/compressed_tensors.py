@@ -517,7 +517,7 @@ class CompressedTensorsConfig(QuantizationConfig):
             logger.warning_once(
                     "Current mxfp8_plus does not support native MXFP8_PLUS."
                     "Running MXFP8_PLUS EmulationMode")
-            return CompressedTensorsW8A8MXFp8Plus(weight_quant=weight_quant, input_quant=input_quant)
+            return CompressedTensorsW8A8MXFp8Plus()
 
         if self._is_wNa16_group_channel(weight_quant, input_quant):
             if (format == CompressionFormat.marlin_24.value
