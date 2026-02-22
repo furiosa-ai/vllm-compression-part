@@ -25,79 +25,19 @@ logger = init_logger(__name__)
 __all__ = ["CompressedTensorsW8A8MXFp8"]
 
 
-torch.library.define(
-    "furiosa::quantize_mxfp8",
-    "(Tensor input, int scale_bits, int ebits, int mbits, float max_norm, "
-    "int group_size, int axis, bool flush_fp32_subnorms, int rounding_mode) -> Tensor",
-    tags=torch.Tag.pt2_compliant_tag,
-)
 
-
-@torch.library.impl("furiosa::quantize_mxfp8", "cuda")
-def quantize_mxfp8_cuda(
+def fake_quantize_mxfp8(
     input: torch.Tensor,
-    scale_bits: int,
-    ebits: int,
-    mbits: int,
-    max_norm: float,
-    group_size: int,
-    axis: int,
-    flush_fp32_subnorms: bool,
-    rounding_mode: int,
+    group_size: int = 32,
+    ebits: int = 4,
+    mbits: int = 5,
+    max_norm: float = 448.0,
+    scale_bits: int = 8,
+    axis: int = -1,
+    flush_fp32_subnorms: bool = False,
+    rounding_mode: int = 2,
 ) -> torch.Tensor:
-    """CUDA 커널 구현"""
-    input_contig = input.contiguous() if not input.is_contiguous() else input
-    return extensions.quantize_mx_by_tile_func_cuda(
-        input_contig,
-        scale_bits,
-        ebits,
-        mbits,
-        max_norm,
-        group_size,
-        axis,
-        flush_fp32_subnorms,
-        rounding_mode,
-    )
-
-
-@torch.library.register_fake("furiosa::quantize_mxfp8")
-def quantize_mxfp8_fake(
-    input: torch.Tensor,
-    scale_bits: int,
-    ebits: int,
-    mbits: int,
-    max_norm: float,
-    group_size: int,
-    axis: int,
-    flush_fp32_subnorms: bool,
-    rounding_mode: int,
-) -> torch.Tensor:
-    """
-    Fake implementation for torch.compile
-    - Shape/dtype inference만 수행 (실제 연산 없음)
-    - Dynamo가 그래프 최적화에 사용
-    """
-    # 출력은 입력과 동일한 shape/dtype
-    return torch.empty_like(input)
-
-
-@torch.library.impl("furiosa::quantize_mxfp8", "cpu")
-def quantize_mxfp8_cpu(
-    input: torch.Tensor,
-    scale_bits: int,
-    ebits: int,
-    mbits: int,
-    max_norm: float,
-    group_size: int,
-    axis: int,
-    flush_fp32_subnorms: bool,
-    rounding_mode: int,
-) -> torch.Tensor:
-    """
-    CPU/Fallback 구현 (PyTorch 네이티브)
-    torch.compile이 trace할 수 없을 때 사용
-    """
-    quantization_args = create_mxfp8_scheme().input_activations
+   quantization_args = create_mxfp8_scheme().input_activations
     scale, zero_point = compute_dynamic_scales_and_zp(
         value=input, args=quantization_args, module=None, global_scale=None
     )
@@ -112,38 +52,6 @@ def quantize_mxfp8_cpu(
     )
     
     return mxfp8_qdq_input.to(input.dtype)
-
-
-def fake_quantize_mxfp8(
-    input: torch.Tensor,
-    group_size: int = 32,
-    ebits: int = 4,
-    mbits: int = 5,
-    max_norm: float = 448.0,
-    scale_bits: int = 8,
-    axis: int = -1,
-    flush_fp32_subnorms: bool = False,
-    rounding_mode: int = 2,
-) -> torch.Tensor:
-    """
-    MXFP8 Quantization wrapper (torch.compile 호환)
-    
-    torch.compile 사용 시:
-    - 처음에는 CPU fallback 사용
-    - 이후 torch.compile이 최적화
-    - 또는 torch.ops.furiosa.quantize_mxfp8를 직접 호출
-    """
-    return torch.ops.furiosa.quantize_mxfp8(
-        input,
-        scale_bits,
-        ebits,
-        mbits,
-        max_norm,
-        group_size,
-        axis,
-        flush_fp32_subnorms,
-        rounding_mode,
-    )
 
 
 # ============================================================================
