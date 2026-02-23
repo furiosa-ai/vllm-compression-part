@@ -25,6 +25,10 @@ logger = init_logger(__name__)
 __all__ = ["CompressedTensorsW8A8MXFp8"]
 
 
+# Create at import time - must be outside torch.compile traced path.
+# Pydantic's SchemaValidator.validate_python is not traceable by Dynamo.
+_MXFP8_INPUT_ACTIVATION_ARGS = create_mxfp8_scheme().input_activations
+
 
 def fake_quantize_mxfp8(
     input: torch.Tensor,
@@ -37,7 +41,7 @@ def fake_quantize_mxfp8(
     flush_fp32_subnorms: bool = False,
     rounding_mode: int = 2,
 ) -> torch.Tensor:
-   quantization_args = create_mxfp8_scheme().input_activations
+    quantization_args = _MXFP8_INPUT_ACTIVATION_ARGS
     scale, zero_point = compute_dynamic_scales_and_zp(
         value=input, args=quantization_args, module=None, global_scale=None
     )
