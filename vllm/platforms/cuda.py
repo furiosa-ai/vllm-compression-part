@@ -36,6 +36,14 @@ pynvml = import_pynvml()
 # see https://github.com/huggingface/diffusers/issues/9704 for details
 torch.backends.cuda.enable_cudnn_sdp(False)
 
+# TF32: mantissa 23bit → 10bit 으로 truncate하여 FP32 matmul 수행. 정밀도 직접 손실.
+torch.backends.cuda.matmul.allow_tf32 = False
+torch.backends.cudnn.allow_tf32 = False
+torch.set_float32_matmul_precision("highest")
+
+# Reduced-precision reduction: FP16/BF16 matmul 중간 accumulation을 저정밀도로 수행. 정밀도 손실.
+torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
+torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
 
 def with_nvml_context(fn: Callable[_P, _R]) -> Callable[_P, _R]:
 
