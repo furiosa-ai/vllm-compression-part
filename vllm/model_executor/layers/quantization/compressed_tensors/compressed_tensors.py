@@ -48,7 +48,9 @@ from vllm.model_executor.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsW4A16Fp4,
     CompressedTensorsW4A16Mxfp4,
     CompressedTensorsW8A8Fp8,
+    CompressedTensorsW8A8GrpFp8,
     CompressedTensorsW8A8Int8,
+    CompressedTensorsW8A8MXFp8,
     CompressedTensorsW8A16Fp8,
     CompressedTensorsWNA16,
 )
@@ -394,6 +396,53 @@ class CompressedTensorsConfig(QuantizationConfig):
         )
 
     @staticmethod
+    def _is_mxfp8(
+        weight_quant: QuantizationArgs,
+        input_quant: QuantizationArgs,
+    ) -> bool:
+        """MXFP8: W8A8 FP8, GROUP strategy, group_size=32, uint8 E8M0 scales."""
+        if weight_quant is None or input_quant is None:
+            return False
+
+        return (
+            weight_quant.strategy == QuantizationStrategy.GROUP.value
+            and input_quant.strategy == QuantizationStrategy.GROUP.value
+            and weight_quant.type == QuantizationType.FLOAT
+            and input_quant.type == QuantizationType.FLOAT
+            and weight_quant.num_bits == 8
+            and input_quant.num_bits == 8
+            and weight_quant.group_size == 32
+            and input_quant.group_size == 32
+            and weight_quant.symmetric
+            and input_quant.symmetric
+            and str(weight_quant.scale_dtype) in ("torch.uint8", "uint8")
+        )
+
+    @staticmethod
+    def _is_grp_fp8(
+        weight_quant: QuantizationArgs,
+        input_quant: QuantizationArgs,
+    ) -> bool:
+        """Group FP8 (MXFP8+): W8A8 FP8, GROUP strategy, group_size=32,
+        non-uint8 scales (bfloat16 or unset)."""
+        if weight_quant is None or input_quant is None:
+            return False
+
+        return (
+            weight_quant.strategy == QuantizationStrategy.GROUP.value
+            and input_quant.strategy == QuantizationStrategy.GROUP.value
+            and weight_quant.type == QuantizationType.FLOAT
+            and input_quant.type == QuantizationType.FLOAT
+            and weight_quant.num_bits == 8
+            and input_quant.num_bits == 8
+            and weight_quant.group_size == 32
+            and input_quant.group_size == 32
+            and weight_quant.symmetric
+            and input_quant.symmetric
+            and str(weight_quant.scale_dtype) not in ("torch.uint8", "uint8")
+        )
+
+    @staticmethod
     def _is_static_tensor_w8a8(
         weight_quant: QuantizationArgs, input_quant: QuantizationArgs
     ) -> bool:
@@ -595,6 +644,25 @@ class CompressedTensorsConfig(QuantizationConfig):
 
         if self._is_mxfp4(weight_quant):
             return CompressedTensorsW4A16Mxfp4()
+
+        if self._is_mxfp8(weight_quant, input_quant):
+            logger.warning_once(
+                "Running MXFP8 in emulation mode (no native kernel)."
+            )
+            return CompressedTensorsW8A8MXFp8(
+                weight_quant=weight_quant,
+                input_quant=input_quant,
+            )
+
+        if self._is_grp_fp8(weight_quant, input_quant):
+            logger.warning_once(
+                "Running group-FP8 (MXFP8+) in emulation mode "
+                "(no native kernel)."
+            )
+            return CompressedTensorsW8A8GrpFp8(
+                weight_quant=weight_quant,
+                input_quant=input_quant,
+            )
 
         if self._is_fp8_w4a8_sm90(weight_quant, input_quant):
             return CompressedTensorsW4A8Fp8(
