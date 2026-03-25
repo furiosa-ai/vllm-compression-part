@@ -48,7 +48,7 @@ from vllm.model_executor.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsW4A16Fp4,
     CompressedTensorsW4A16Mxfp4,
     CompressedTensorsW8A8Fp8,
-    CompressedTensorsW8A8GrpFp8,
+    CompressedTensorsW8A8GroupFp8,
     CompressedTensorsW8A8Int8,
     CompressedTensorsW8A8MXFp8,
     CompressedTensorsW8A16Fp8,
@@ -419,7 +419,7 @@ class CompressedTensorsConfig(QuantizationConfig):
         )
 
     @staticmethod
-    def _is_grp_fp8(
+    def _is_group_fp8(
         weight_quant: QuantizationArgs,
         input_quant: QuantizationArgs,
     ) -> bool:
@@ -654,12 +654,12 @@ class CompressedTensorsConfig(QuantizationConfig):
                 input_quant=input_quant,
             )
 
-        if self._is_grp_fp8(weight_quant, input_quant):
+        if self._is_group_fp8(weight_quant, input_quant):
             logger.warning_once(
                 "Running group-FP8 (MXFP8+) in emulation mode "
                 "(no native kernel)."
             )
-            return CompressedTensorsW8A8GrpFp8(
+            return CompressedTensorsW8A8GroupFp8(
                 weight_quant=weight_quant,
                 input_quant=input_quant,
             )

@@ -34,12 +34,12 @@ from vllm.model_executor.parameter import (
 
 logger = init_logger(__name__)
 
-__all__ = ["CompressedTensorsW8A8GrpFp8"]
+__all__ = ["CompressedTensorsW8A8GroupFp8"]
 
-_GRP_FP8_GROUP_SIZE = 32
+_GROUP_FP8_GROUP_SIZE = 32
 
 
-class CompressedTensorsW8A8GrpFp8(CompressedTensorsScheme):
+class CompressedTensorsW8A8GroupFp8(CompressedTensorsScheme):
     """
     Emulation-mode group-FP8 (MXFP8+) W8A8 scheme.
 
@@ -56,7 +56,7 @@ class CompressedTensorsW8A8GrpFp8(CompressedTensorsScheme):
     ):
         self.weight_quant = weight_quant
         self.input_quant = input_quant
-        self.group_size = weight_quant.group_size or _GRP_FP8_GROUP_SIZE
+        self.group_size = weight_quant.group_size or _GROUP_FP8_GROUP_SIZE
 
     @classmethod
     def get_min_capability(cls) -> int:
