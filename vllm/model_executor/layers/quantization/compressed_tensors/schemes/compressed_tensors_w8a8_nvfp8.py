@@ -21,12 +21,18 @@ At inference time activations are dynamically fake-quantized per group
 before a standard torch.matmul with the dequantized weights.
 """
 
+import math
 from collections.abc import Callable
 
 import torch
-from compressed_tensors.quantization import QuantizationArgs
+from compressed_tensors.quantization import QuantizationArgs, QuantizationStrategy
 from compressed_tensors.quantization.lifecycle.forward import fake_quantize
 from compressed_tensors.quantization.utils import compute_dynamic_scales_and_zp
+from compressed_tensors.quantization.utils.helpers import (
+    FP8_E4M3_DATA,
+    FP4_E2M1_DATA,
+    generate_gparam,
+)
 
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.compressed_tensors.schemes import (
@@ -136,6 +142,25 @@ class CompressedTensorsW8A8NVFp8(CompressedTensorsScheme):
         del layer.weight_scale
         del layer.weight_global_scale
 
+    def _compute_activation_global_scale(self, x: torch.Tensor) -> torch.Tensor:
+        """Compute dynamic global_scale for TENSOR_GROUP activation quantization.
+
+        Must match the logic in compute_dynamic_scales_and_zp so the same
+        global_scale that was baked into the combined scale is recovered.
+        """
+        gs = self.group_size
+        reshaped = x.unflatten(-1, (math.ceil(x.shape[-1] / gs), gs))
+        min_val = torch.amin(reshaped, dim=-1)
+        max_val = torch.amax(reshaped, dim=-1)
+        quant_data = (
+            FP8_E4M3_DATA if self.input_quant.num_bits == 8 else FP4_E2M1_DATA
+        )
+        return generate_gparam(
+            min_val.amin().reshape(1),
+            max_val.amax().reshape(1),
+            quant_data=quant_data,
+        )
+
     def apply_weights(
         self,
         layer: torch.nn.Module,
@@ -144,16 +169,20 @@ class CompressedTensorsW8A8NVFp8(CompressedTensorsScheme):
     ) -> torch.Tensor:
         if self.input_quant is not None:
             # W8A8: dynamic TENSOR_GROUP activation quantization
-            # compute_dynamic_scales_and_zp computes global_scale on the fly
-            # when global_scale is None (our patch to helpers.py)
+            # compute_dynamic_scales_and_zp bakes global_scale into returned
+            # scale (combined = global * local).  fake_quantize needs
+            # global_scale so it can divide it back out before quantizing.
             scale, zero_point = compute_dynamic_scales_and_zp(
                 value=x, args=self.input_quant, module=None, global_scale=None
             )
+            # Recompute the same global_scale that was baked into scale
+            global_scale = self._compute_activation_global_scale(x)
             qdq_input = fake_quantize(
                 x=x,
                 scale=scale,
                 zero_point=zero_point,
                 args=self.input_quant,
+                global_scale=global_scale,
             ).to(x.dtype)
         else:
             # W8A16: weights already dequantized at load time, pass through
