@@ -11,6 +11,7 @@ from .compressed_tensors_w8a8_fp8 import CompressedTensorsW8A8Fp8
 from .compressed_tensors_w8a8_group_fp8 import CompressedTensorsW8A8GroupFp8
 from .compressed_tensors_w8a8_int8 import CompressedTensorsW8A8Int8
 from .compressed_tensors_w8a8_mxfp8 import CompressedTensorsW8A8MXFp8
+from .compressed_tensors_w8a8_nvfp8 import CompressedTensorsW8A8NVFp8
 from .compressed_tensors_w8a16_fp8 import CompressedTensorsW8A16Fp8
 from .compressed_tensors_wNa16 import WNA16_SUPPORTED_BITS, CompressedTensorsWNA16
 
@@ -24,6 +25,7 @@ __all__ = [
     "CompressedTensorsW8A8Int8",
     "CompressedTensorsW8A8Fp8",
     "CompressedTensorsW8A8MXFp8",
+    "CompressedTensorsW8A8NVFp8",
     "CompressedTensorsW8A8GroupFp8",
     "WNA16_SUPPORTED_BITS",
     "CompressedTensors24",

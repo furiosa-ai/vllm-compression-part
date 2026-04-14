@@ -51,6 +51,7 @@ from vllm.model_executor.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsW8A8GroupFp8,
     CompressedTensorsW8A8Int8,
     CompressedTensorsW8A8MXFp8,
+    CompressedTensorsW8A8NVFp8,
     CompressedTensorsW8A16Fp8,
     CompressedTensorsWNA16,
 )
@@ -419,12 +420,34 @@ class CompressedTensorsConfig(QuantizationConfig):
         )
 
     @staticmethod
+    def _is_nvfp8(
+        weight_quant: QuantizationArgs,
+        input_quant: QuantizationArgs,
+    ) -> bool:
+        """NVFP8: W8A8 FP8, TENSOR_GROUP strategy, group_size=16,
+        FP8 local scale + FP32 global scale."""
+        if weight_quant is None or input_quant is None:
+            return False
+
+        return (
+            weight_quant.strategy == QuantizationStrategy.TENSOR_GROUP.value
+            and input_quant.strategy == QuantizationStrategy.TENSOR_GROUP.value
+            and weight_quant.type == QuantizationType.FLOAT
+            and input_quant.type == QuantizationType.FLOAT
+            and weight_quant.num_bits == 8
+            and input_quant.num_bits == 8
+            and weight_quant.group_size == 16
+            and weight_quant.symmetric
+            and input_quant.symmetric
+        )
+
+    @staticmethod
     def _is_group_fp8(
         weight_quant: QuantizationArgs,
         input_quant: QuantizationArgs,
     ) -> bool:
-        """Group FP8 (MXFP8+): W8A8 FP8, GROUP strategy, group_size=32,
-        non-uint8 scales (bfloat16 or unset)."""
+        """Group FP8 (MXFP8+ / NVFP8+): W8A8 FP8, GROUP strategy,
+        group_size in {16, 32}, non-uint8 scales (bfloat16 or unset)."""
         if weight_quant is None or input_quant is None:
             return False
 
@@ -435,8 +458,8 @@ class CompressedTensorsConfig(QuantizationConfig):
             and input_quant.type == QuantizationType.FLOAT
             and weight_quant.num_bits == 8
             and input_quant.num_bits == 8
-            and weight_quant.group_size == 32
-            and input_quant.group_size == 32
+            and weight_quant.group_size in (16, 32)
+            and input_quant.group_size in (16, 32)
             and weight_quant.symmetric
             and input_quant.symmetric
             and str(weight_quant.scale_dtype) not in ("torch.uint8", "uint8")
@@ -644,6 +667,15 @@ class CompressedTensorsConfig(QuantizationConfig):
 
         if self._is_mxfp4(weight_quant):
             return CompressedTensorsW4A16Mxfp4()
+
+        if self._is_nvfp8(weight_quant, input_quant):
+            logger.warning_once(
+                "Running NVFP8 in emulation mode (no native kernel)."
+            )
+            return CompressedTensorsW8A8NVFp8(
+                weight_quant=weight_quant,
+                input_quant=input_quant,
+            )
 
         if self._is_mxfp8(weight_quant, input_quant):
             logger.warning_once(
