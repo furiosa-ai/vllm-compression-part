@@ -104,12 +104,12 @@ class CompressedTensorsW8A8NVFp8(CompressedTensorsScheme):
         layer.register_parameter("weight", weight)
 
         # Combined local scale: (out, in // group_size)
-        # Stores global_scale * local_raw; dtype is bfloat16 (checkpoint dtype)
+        # Stored as float8_e4m3fn in checkpoint (matching NVFP8 spec)
         weight_scale = GroupQuantScaleParameter(
             data=torch.empty(
                 output_size_per_partition,
                 input_size_per_partition // self.group_size,
-                dtype=torch.bfloat16,
+                dtype=torch.float8_e4m3fn,
             ),
             input_dim=1,
             output_dim=0,
