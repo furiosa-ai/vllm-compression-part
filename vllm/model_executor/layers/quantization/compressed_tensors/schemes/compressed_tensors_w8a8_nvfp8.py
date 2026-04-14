@@ -97,13 +97,13 @@ class CompressedTensorsW8A8NVFp8(CompressedTensorsScheme):
         )
         layer.register_parameter("weight", weight)
 
-        # FP8 combined local scale: (out, in // group_size)
-        # Already encodes global_scale * local_pre, rounded to fp8
+        # Combined local scale: (out, in // group_size)
+        # Stores global_scale * local_raw; dtype is bfloat16 (checkpoint dtype)
         weight_scale = GroupQuantScaleParameter(
             data=torch.empty(
                 output_size_per_partition,
                 input_size_per_partition // self.group_size,
-                dtype=torch.float8_e4m3fn,
+                dtype=torch.bfloat16,
             ),
             input_dim=1,
             output_dim=0,
@@ -120,14 +120,16 @@ class CompressedTensorsW8A8NVFp8(CompressedTensorsScheme):
         layer.register_parameter("weight_global_scale", weight_global_scale)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        # Convert fp8 scale to float32 first (fp8 arithmetic not supported on CPU,
-        # and dequantize expects a floating-point scale tensor)
+        # weight_scale stores combined = global_scale * local_raw (in bfloat16)
+        # weight_fp8 was quantized as: round(w / combined) → subnormals ~0.002
+        # Reconstruction: w = w_fp8 * combined / global_scale = w_fp8 * local_raw
         float_scale = layer.weight_scale.data.to(torch.float32)
-        # Expand combined scale: (out, in//16) → (out, in)
+        # Expand combined scale: (out, in//group_size) → (out, in)
         scale_expanded = float_scale.repeat_interleave(self.group_size, dim=1)
-        # Dequantize: weight_fp8 → float32, then multiply by combined scale
-        # (global_scale is already baked into weight_scale at quantization time)
-        dq_weight = layer.weight.data.to(torch.float32) * scale_expanded
+        # global_scale: scalar fp32 (max across partitions)
+        global_s = layer.weight_global_scale.data.to(torch.float32).max()
+        # Dequantize: divide by global_scale to cancel it out of combined scale
+        dq_weight = layer.weight.data.to(torch.float32) * scale_expanded / global_s
         layer.weight = torch.nn.Parameter(
             dq_weight.to(layer.params_dtype), requires_grad=False
         )
@@ -140,19 +142,22 @@ class CompressedTensorsW8A8NVFp8(CompressedTensorsScheme):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        # Dynamic TENSOR_GROUP activation quantization
-        # compute_dynamic_scales_and_zp computes global_scale on the fly
-        # when global_scale is None (our patch to helpers.py)
-        scale, zero_point = compute_dynamic_scales_and_zp(
-            value=x, args=self.input_quant, module=None, global_scale=None
-        )
-        qdq_input = fake_quantize(
-            x=x,
-            scale=scale,
-            zero_point=zero_point,
-            args=self.input_quant,
-        )
-        qdq_input = qdq_input.to(x.dtype)
+        if self.input_quant is not None:
+            # W8A8: dynamic TENSOR_GROUP activation quantization
+            # compute_dynamic_scales_and_zp computes global_scale on the fly
+            # when global_scale is None (our patch to helpers.py)
+            scale, zero_point = compute_dynamic_scales_and_zp(
+                value=x, args=self.input_quant, module=None, global_scale=None
+            )
+            qdq_input = fake_quantize(
+                x=x,
+                scale=scale,
+                zero_point=zero_point,
+                args=self.input_quant,
+            ).to(x.dtype)
+        else:
+            # W8A16: weights already dequantized at load time, pass through
+            qdq_input = x
 
         out = torch.matmul(qdq_input, layer.weight.to(qdq_input.dtype).t())
         if bias is not None:
