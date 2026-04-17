@@ -420,12 +420,25 @@ class CompressedTensorsConfig(QuantizationConfig):
         )
 
     @staticmethod
+    def _is_nvfp8_weight(weight_quant: QuantizationArgs) -> bool:
+        """True when weight args match the NVFP8 / NVFP8A16 pattern:
+        TENSOR_GROUP, 8-bit float, group_size=16, symmetric."""
+        if weight_quant is None:
+            return False
+        return (
+            weight_quant.strategy == QuantizationStrategy.TENSOR_GROUP.value
+            and weight_quant.type == QuantizationType.FLOAT
+            and weight_quant.num_bits == 8
+            and weight_quant.group_size == 16
+            and weight_quant.symmetric
+        )
+
+    @staticmethod
     def _is_nvfp8(
         weight_quant: QuantizationArgs,
         input_quant: QuantizationArgs,
     ) -> bool:
-        """NVFP8: W8A8 FP8, TENSOR_GROUP strategy, group_size=16,
-        FP8 local scale + FP32 global scale."""
+        """NVFP8 W8A8: TENSOR_GROUP, group_size=16, FP8 local + FP32 global scale."""
         if weight_quant is None or input_quant is None:
             return False
 
@@ -439,6 +452,17 @@ class CompressedTensorsConfig(QuantizationConfig):
             and weight_quant.group_size == 16
             and weight_quant.symmetric
             and input_quant.symmetric
+        )
+
+    @staticmethod
+    def _is_nvfp8a16(
+        weight_quant: QuantizationArgs,
+        input_quant: QuantizationArgs,
+    ) -> bool:
+        """NVFP8A16 W8A16: weights TENSOR_GROUP 8-bit, no activation quant."""
+        return (
+            CompressedTensorsConfig._is_nvfp8_weight(weight_quant)
+            and input_quant is None
         )
 
     @staticmethod
@@ -667,6 +691,15 @@ class CompressedTensorsConfig(QuantizationConfig):
 
         if self._is_mxfp4(weight_quant):
             return CompressedTensorsW4A16Mxfp4()
+
+        if self._is_nvfp8a16(weight_quant, input_quant):
+            logger.warning_once(
+                "Running NVFP8A16 (weights-only) in emulation mode (no native kernel)."
+            )
+            return CompressedTensorsW8A8NVFp8(
+                weight_quant=weight_quant,
+                input_quant=None,
+            )
 
         if self._is_nvfp8(weight_quant, input_quant):
             logger.warning_once(

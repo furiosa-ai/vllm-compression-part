@@ -2,23 +2,16 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 """
-NVFP8 W8A8 scheme for compressed-tensors models.
+NVFP8 W8A8 / W8A16 scheme for compressed-tensors models.
 
-Handles models with:
-  - format: float-quantized
-  - weight strategy: tensor_group (group_size=16)
-  - weight scale_dtype: float8_e4m3fn  (local per-16 scale)
-  - weight global_scale: float32       (per-tensor global scale)
-  - input strategy: tensor_group (dynamic=True)
+Checkpoint layout:
+  - weight:              float8_e4m3fn  (FP8 quantized data)
+  - weight_scale:        float8_e4m3fn  (combined = global_scale * local_scale)
+  - weight_global_scale: float32        (per-tensor global scale)
 
-The weight_scale stored in the checkpoint is already the *combined*
-scale: round_to_fp8(global_scale * local_pre).  The global_scale
-parameter is registered (to absorb checkpoint keys) but is not needed
-for dequantization.
-
-At load time weights are dequantized to the model dtype.
-At inference time activations are dynamically fake-quantized per group
-before a standard torch.matmul with the dequantized weights.
+At load time, weights are dequantized via compressed_tensors.dequantize().
+At inference time (W8A8), activations are dynamically fake-quantized
+(TENSOR_GROUP, group_size=16) before a standard torch.matmul.
 """
 
 import math
@@ -26,7 +19,7 @@ from collections.abc import Callable
 
 import torch
 from compressed_tensors.quantization import QuantizationArgs, QuantizationStrategy
-from compressed_tensors.quantization.lifecycle.forward import fake_quantize
+from compressed_tensors.quantization.lifecycle.forward import dequantize, fake_quantize
 from compressed_tensors.quantization.utils import compute_dynamic_scales_and_zp
 from compressed_tensors.quantization.utils.helpers import (
     FP8_E4M3_DATA,
@@ -117,8 +110,7 @@ class CompressedTensorsW8A8NVFp8(CompressedTensorsScheme):
         )
         layer.register_parameter("weight_scale", weight_scale)
 
-        # FP32 global scale — registered to absorb checkpoint keys;
-        # not used during dequantization (already baked into weight_scale).
+        # FP32 global scale — used in dequantize to factor out of combined scale.
         weight_global_scale = PerTensorScaleParameter(
             data=torch.empty(len(output_partition_sizes), dtype=torch.float32),
             weight_loader=weight_loader,
@@ -126,16 +118,14 @@ class CompressedTensorsW8A8NVFp8(CompressedTensorsScheme):
         layer.register_parameter("weight_global_scale", weight_global_scale)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        # weight_scale stores combined = global_scale * local_raw (in bfloat16)
-        # weight_fp8 was quantized as: round(w / combined) → subnormals ~0.002
-        # Reconstruction: w = w_fp8 * combined / global_scale = w_fp8 * local_raw
-        float_scale = layer.weight_scale.data.to(torch.float32)
-        # Expand combined scale: (out, in//group_size) → (out, in)
-        scale_expanded = float_scale.repeat_interleave(self.group_size, dim=1)
-        # global_scale: scalar fp32 (max across partitions)
-        global_s = layer.weight_global_scale.data.to(torch.float32).max()
-        # Dequantize: divide by global_scale to cancel it out of combined scale
-        dq_weight = layer.weight.data.to(torch.float32) * scale_expanded / global_s
+        # global_scale may have shape (num_partitions,) from QKV merge;
+        # reduce to scalar for correct broadcasting in dequantize.
+        global_scale = layer.weight_global_scale.data.max().reshape(1)
+        dq_weight = dequantize(
+            x_q=layer.weight.data,
+            scale=layer.weight_scale.data.to(torch.float32),
+            global_scale=global_scale,
+        )
         layer.weight = torch.nn.Parameter(
             dq_weight.to(layer.params_dtype), requires_grad=False
         )
@@ -143,11 +133,7 @@ class CompressedTensorsW8A8NVFp8(CompressedTensorsScheme):
         del layer.weight_global_scale
 
     def _compute_activation_global_scale(self, x: torch.Tensor) -> torch.Tensor:
-        """Compute dynamic global_scale for TENSOR_GROUP activation quantization.
-
-        Must match the logic in compute_dynamic_scales_and_zp so the same
-        global_scale that was baked into the combined scale is recovered.
-        """
+        """Compute dynamic global_scale for TENSOR_GROUP activation quantization."""
         gs = self.group_size
         reshaped = x.unflatten(-1, (math.ceil(x.shape[-1] / gs), gs))
         min_val = torch.amin(reshaped, dim=-1)
@@ -168,14 +154,9 @@ class CompressedTensorsW8A8NVFp8(CompressedTensorsScheme):
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if self.input_quant is not None:
-            # W8A8: dynamic TENSOR_GROUP activation quantization
-            # compute_dynamic_scales_and_zp bakes global_scale into returned
-            # scale (combined = global * local).  fake_quantize needs
-            # global_scale so it can divide it back out before quantizing.
             scale, zero_point = compute_dynamic_scales_and_zp(
                 value=x, args=self.input_quant, module=None, global_scale=None
             )
-            # Recompute the same global_scale that was baked into scale
             global_scale = self._compute_activation_global_scale(x)
             qdq_input = fake_quantize(
                 x=x,
