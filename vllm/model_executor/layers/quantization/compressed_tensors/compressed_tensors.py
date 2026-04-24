@@ -401,7 +401,9 @@ class CompressedTensorsConfig(QuantizationConfig):
         weight_quant: QuantizationArgs,
         input_quant: QuantizationArgs,
     ) -> bool:
-        """MXFP8: W8A8 FP8, GROUP strategy, group_size=32, uint8 E8M0 scales."""
+        """MXFP8 / MXFP8_g16: W8A8 FP8, GROUP strategy, uint8 E8M0 scales.
+        Accepts group_size in {16, 32} — stock MX spec uses 32, the g16 variant
+        uses the NVFP8 block size with uint8 scales."""
         if weight_quant is None or input_quant is None:
             return False
 
@@ -412,8 +414,8 @@ class CompressedTensorsConfig(QuantizationConfig):
             and input_quant.type == QuantizationType.FLOAT
             and weight_quant.num_bits == 8
             and input_quant.num_bits == 8
-            and weight_quant.group_size == 32
-            and input_quant.group_size == 32
+            and weight_quant.group_size in (16, 32)
+            and input_quant.group_size == weight_quant.group_size
             and weight_quant.symmetric
             and input_quant.symmetric
             and str(weight_quant.scale_dtype) in ("torch.uint8", "uint8")

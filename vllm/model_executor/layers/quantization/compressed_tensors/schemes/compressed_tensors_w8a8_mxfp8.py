@@ -39,7 +39,6 @@ logger = init_logger(__name__)
 __all__ = ["CompressedTensorsW8A8MXFp8"]
 
 _MXFP8_INPUT_ACT_ARGS: QuantizationArgs = MXFP8["input_activations"]
-_MXFP8_GROUP_SIZE = 32
 
 
 class CompressedTensorsW8A8MXFp8(CompressedTensorsScheme):
@@ -50,6 +49,9 @@ class CompressedTensorsW8A8MXFp8(CompressedTensorsScheme):
     At load time, weights are dequantized to the model dtype.
     At inference time, activations undergo dynamic per-group MX fake-quantize
     before a standard matmul with the dequantized weights.
+
+    Supports the standard MXFP8 (group_size=32) and the MXFP8_g16 variant
+    (group_size=16) — group size is taken from the config.
     """
 
     def __init__(
@@ -59,7 +61,7 @@ class CompressedTensorsW8A8MXFp8(CompressedTensorsScheme):
     ):
         self.weight_quant = weight_quant
         self.input_quant = input_quant
-        self.group_size = _MXFP8_GROUP_SIZE
+        self.group_size = weight_quant.group_size
 
     @classmethod
     def get_min_capability(cls) -> int:
@@ -122,7 +124,7 @@ class CompressedTensorsW8A8MXFp8(CompressedTensorsScheme):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        act_args = _MXFP8_INPUT_ACT_ARGS
+        act_args = self.input_quant
 
         scale, zero_point = compute_dynamic_scales_and_zp(
             value=x, args=act_args, module=None, global_scale=None
