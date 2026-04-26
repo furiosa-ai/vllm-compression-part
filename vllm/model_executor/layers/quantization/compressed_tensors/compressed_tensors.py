@@ -94,6 +94,7 @@ class CompressedTensorsConfig(QuantizationConfig):
         transform_config: dict[str, Any] | None = None,
         total_num_heads: int | None = None,
         total_num_kv_heads: int | None = None,
+        partial_sum_config: Any | None = None,
     ):
         super().__init__()
         self.ignore = ignore
@@ -106,6 +107,7 @@ class CompressedTensorsConfig(QuantizationConfig):
         self.config = config
         self.total_num_heads = total_num_heads
         self.total_num_kv_heads = total_num_kv_heads
+        self.partial_sum_config = partial_sum_config
 
         if transform_config:
             self.transform_config = TransformConfig.model_validate(transform_config)
@@ -157,6 +159,15 @@ class CompressedTensorsConfig(QuantizationConfig):
         self.sparsity_ignore_list = _apply_list(self.sparsity_ignore_list)
         if self.kv_cache_scheme is not None:
             self.kv_cache_scheme = _apply_dict(self.kv_cache_scheme)
+        if self.partial_sum_config is not None:
+            if self.partial_sum_config.targets:
+                self.partial_sum_config.targets = _apply_list(
+                    self.partial_sum_config.targets
+                )
+            if self.partial_sum_config.ignore:
+                self.partial_sum_config.ignore = _apply_list(
+                    self.partial_sum_config.ignore
+                )
 
     def get_quant_method(
         self,
@@ -178,20 +189,61 @@ class CompressedTensorsConfig(QuantizationConfig):
 
             # choose transform method
             if any((input_tfms, output_tfms)):
-                return CompressedTensorsLinearTransformMethod.from_schemes(
+                quant_method = CompressedTensorsLinearTransformMethod.from_schemes(
                     quant_method, quant_scheme, input_tfms, output_tfms
                 )
 
-            else:
-                return quant_method
+            # Wrap UnquantizedLinearMethod with partial-sum QDQ if this
+            # layer matches a partial_sum target. (Quantized path is
+            # already handled in get_scheme via CompressedTensorsPartialSum.)
+            quant_method = self._maybe_wrap_unquant_partial_sum(
+                quant_method, prefix
+            )
+            return quant_method
 
         if isinstance(layer, Attention):
             return CompressedTensorsKVCacheMethod(self)
         if isinstance(layer, FusedMoE):
+            # get_moe_method internally wraps with partial_sum if configured.
             return CompressedTensorsMoEMethod.get_moe_method(
                 self, layer, layer_name=prefix
             )
         return None
+
+    def _maybe_wrap_unquant_partial_sum(self, method, prefix):
+        """
+        Decorate an UnquantizedLinearMethod with partial-sum QDQ if the
+        layer matches the partial_sum config. Quantized schemes are
+        already wrapped inside ``get_scheme``.
+        """
+        ps_cfg = getattr(self, "partial_sum_config", None)
+        if ps_cfg is None or prefix is None:
+            return method
+        from compressed_tensors.linear.partialsum_linear import (
+            is_partial_sum_target,
+        )
+
+        if not is_partial_sum_target(prefix, ps_cfg.targets, ps_cfg.ignore):
+            return method
+        # Compare by class name so we don't break the import chain if
+        # UnquantizedLinearMethod moves.
+        if type(method).__name__ != "UnquantizedLinearMethod":
+            return method
+
+        from vllm.model_executor.layers.quantization.compressed_tensors.schemes.compressed_tensors_partial_sum import (  # noqa: E501
+            make_unquant_partial_sum_wrapper,
+        )
+
+        wrapped = make_unquant_partial_sum_wrapper(
+            method, ps_cfg.num_ranks, ps_cfg.quant_args
+        )
+        logger.info(
+            "PartialSum[unquant]: %s wrapped over UnquantizedLinearMethod "
+            "(num_ranks=%d)",
+            prefix,
+            ps_cfg.num_ranks,
+        )
+        return wrapped
 
     def _add_fused_moe_to_target_scheme_map(self):
         """
@@ -233,6 +285,17 @@ class CompressedTensorsConfig(QuantizationConfig):
             config=config
         )
 
+        partial_sum_config = None
+        partial_sum_dict = config.get("partial_sum")
+        if partial_sum_dict is not None:
+            # Imported lazily so vLLM still works with older compressed-tensors
+            # versions that predate PartialSumConfig.
+            from compressed_tensors.quantization.quant_config import (
+                PartialSumConfig,
+            )
+
+            partial_sum_config = PartialSumConfig.model_validate(partial_sum_dict)
+
         return cls(
             target_scheme_map=target_scheme_map,
             ignore=ignore,
@@ -244,6 +307,7 @@ class CompressedTensorsConfig(QuantizationConfig):
             kv_cache_scheme=config.get("kv_cache_scheme"),
             total_num_heads=config.get("total_num_heads"),
             total_num_kv_heads=config.get("total_num_kv_heads"),
+            partial_sum_config=partial_sum_config,
         )
 
     @classmethod
@@ -778,6 +842,34 @@ class CompressedTensorsConfig(QuantizationConfig):
                 format=format,
                 layer_name=layer_name,
             )
+
+        # Wrap with partial-sum QDQ if this layer is a partial_sum target.
+        if self.partial_sum_config is not None and layer_name is not None:
+            from compressed_tensors.linear.partialsum_linear import (
+                is_partial_sum_target,
+            )
+
+            if is_partial_sum_target(
+                layer_name,
+                self.partial_sum_config.targets,
+                self.partial_sum_config.ignore,
+            ):
+                from vllm.model_executor.layers.quantization.compressed_tensors.schemes import (  # noqa: E501
+                    CompressedTensorsPartialSum,
+                )
+
+                inner_name = type(scheme).__name__
+                scheme = CompressedTensorsPartialSum(
+                    inner=scheme,
+                    num_ranks=self.partial_sum_config.num_ranks,
+                    partial_sum_quant_args=self.partial_sum_config.quant_args,
+                )
+                logger.info(
+                    "PartialSum[quant]: %s wrapped over %s (num_ranks=%d)",
+                    layer_name,
+                    inner_name,
+                    self.partial_sum_config.num_ranks,
+                )
 
         # Raise error if device does not support the scheme
         # (e.g. fp8 needs ada lovelace)

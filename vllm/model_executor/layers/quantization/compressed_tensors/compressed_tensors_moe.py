@@ -125,6 +125,58 @@ class CompressedTensorsMoEMethod(FusedMoEMethodBase):
         layer: torch.nn.Module,
         layer_name: str,
     ) -> FusedMoEMethodBase:
+        method = CompressedTensorsMoEMethod._resolve_moe_method(
+            quant_config, layer, layer_name
+        )
+        return CompressedTensorsMoEMethod._maybe_wrap_partial_sum(
+            method, quant_config, layer_name
+        )
+
+    @staticmethod
+    def _maybe_wrap_partial_sum(
+        method: FusedMoEMethodBase,
+        quant_config: "CompressedTensorsConfig",  # type: ignore # noqa E501
+        layer_name: str,
+    ) -> FusedMoEMethodBase:
+        """
+        Decorate a FusedMoE quant method with post-kernel QDQ if the MoE
+        layer matches the partial_sum config. The fused MoE kernel produces
+        the rank-local partial sum; we QDQ that partial before FusedMoE's
+        TP all-reduce. This emulates quantized communication on the
+        all-reduce boundary.
+        """
+        ps_cfg = getattr(quant_config, "partial_sum_config", None)
+        if ps_cfg is None or layer_name is None or method is None:
+            return method
+        from compressed_tensors.linear.partialsum_linear import (
+            is_partial_sum_target,
+        )
+
+        if not is_partial_sum_target(layer_name, ps_cfg.targets, ps_cfg.ignore):
+            return method
+
+        from vllm.model_executor.layers.quantization.compressed_tensors.schemes.compressed_tensors_partial_sum import (  # noqa: E501
+            make_moe_partial_sum_wrapper,
+        )
+
+        inner_name = type(method).__name__
+        wrapped = make_moe_partial_sum_wrapper(
+            method, ps_cfg.num_ranks, ps_cfg.quant_args
+        )
+        logger.info(
+            "PartialSum[moe]: %s wrapped over %s (num_ranks=%d)",
+            layer_name,
+            inner_name,
+            ps_cfg.num_ranks,
+        )
+        return wrapped
+
+    @staticmethod
+    def _resolve_moe_method(
+        quant_config: "CompressedTensorsConfig",  # type: ignore # noqa E501
+        layer: torch.nn.Module,
+        layer_name: str,
+    ) -> FusedMoEMethodBase:
         # FusedMoE was made by combining multiple Linears so need to
         # make sure quantization config for Linear can target it
         quant_config._add_fused_moe_to_target_scheme_map()
