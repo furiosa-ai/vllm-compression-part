@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from .compressed_tensors_scheme import CompressedTensorsScheme
-from .compressed_tensors_partial_sum import CompressedTensorsPartialSum
 from .compressed_tensors_w4a4_nvfp4 import CompressedTensorsW4A4Fp4
 from .compressed_tensors_w4a8_fp8 import CompressedTensorsW4A8Fp8
 from .compressed_tensors_w4a8_int import CompressedTensorsW4A8Int
@@ -35,5 +34,4 @@ __all__ = [
     "CompressedTensorsW4A4Fp4",
     "CompressedTensorsW4A8Int",
     "CompressedTensorsW4A8Fp8",
-    "CompressedTensorsPartialSum",
 ]

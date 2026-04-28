@@ -14,18 +14,16 @@ Semantics:
   before the TP all-reduce" — i.e. emulated low-precision communication.
 
 Design notes:
-  * The emulation R = TP (one QDQ per rank per layer). There is no inner
-    K-split; the ``partial_sum.num_ranks`` field in the checkpoint config
-    is retained for backward compatibility but has no effect on semantics
-    (the actual shard count is always ``tp_size``).
-  * Linear (both quantized schemes and UnquantizedLinearMethod) and
-    FusedMoE are handled uniformly as post-hooks -- we always call the
-    inner ``apply`` / ``apply_weights`` first, then QDQ the result.
-  * For quantized Linear the inner scheme's weight-loading and matmul path
-    (e.g. Marlin for NVFP4) run unchanged; only the output is QDQ'd.
+  * The emulation R = TP (one QDQ per rank per layer). The
+    ``partial_sum.num_ranks`` field in the checkpoint config has no effect
+    on semantics (the actual shard count is always ``tp_size``).
+  * All three layer types (quantized Linear, unquantized Linear, FusedMoE)
+    are wrapped uniformly via in-place monkey-patch of the function that
+    produces the rank-local partial -- ``scheme.apply_weights`` for
+    quantized Linear, ``method.apply`` for the other two.
 
 Entry points:
-  * :class:`CompressedTensorsPartialSum` -- Linear-scheme decorator.
+  * :func:`make_scheme_partial_sum_wrapper` -- quantized Linear scheme.
   * :func:`make_unquant_partial_sum_wrapper` -- UnquantizedLinearMethod.
   * :func:`make_moe_partial_sum_wrapper` -- FusedMoE quant method.
 """
@@ -51,14 +49,11 @@ from compressed_tensors.quantization.utils import (
 )
 
 from vllm.logger import init_logger
-from vllm.model_executor.layers.quantization.compressed_tensors.schemes.compressed_tensors_scheme import (  # noqa: E501
-    CompressedTensorsScheme,
-)
 
 logger = init_logger(__name__)
 
 __all__ = [
-    "CompressedTensorsPartialSum",
+    "make_scheme_partial_sum_wrapper",
     "make_unquant_partial_sum_wrapper",
     "make_moe_partial_sum_wrapper",
 ]
@@ -117,52 +112,34 @@ def _qdq_partial_sums(
     return qdq.reshape(original_shape).to(original_dtype)
 
 
-# ─── Scheme decorator for Linear ───────────────────────────────────────────
+# ─── Scheme post-hook (quantized Linear) ───────────────────────────────────
 
-class CompressedTensorsPartialSum(CompressedTensorsScheme):
+def make_scheme_partial_sum_wrapper(
+    inner_scheme: Any,
+    num_ranks: int,
+    partial_sum_quant_args: QuantizationArgs,
+) -> Any:
     """
-    Post-hook decorator scheme that QDQs the inner scheme's matmul output.
-    Weight loading + the actual matmul path (e.g. Marlin kernels, Cutlass)
-    run unchanged; we only intercept ``apply_weights`` to fake-quantize the
-    rank-local partial output before vLLM's all-reduce.
+    In-place decorate a quantized ``CompressedTensorsScheme`` instance so
+    its ``apply_weights(layer, x, bias)`` runs a post-hook QDQ. The inner
+    matmul (e.g. Marlin kernels, Cutlass) runs unchanged; we only QDQ its
+    output before vLLM's all-reduce.
     """
+    _orig_apply_weights = inner_scheme.apply_weights
 
-    def __init__(
-        self,
-        inner: CompressedTensorsScheme,
-        num_ranks: int,
-        partial_sum_quant_args: QuantizationArgs,
-    ):
-        self.inner = inner
-        # Retained only for config introspection / logging. The emulation
-        # uses R = TP regardless of this value.
-        self.num_ranks = num_ranks
-        self.partial_sum_quant_args = partial_sum_quant_args
-
-    def get_min_capability(self) -> int:  # type: ignore[override]
-        return self.inner.get_min_capability()
-
-    def create_weights(self, *args, **kwargs):
-        return self.inner.create_weights(*args, **kwargs)
-
-    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        self.inner.process_weights_after_loading(layer)
-
-    def apply_weights(
-        self,
-        layer: torch.nn.Module,
-        x: torch.Tensor,
-        bias: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        # Let the inner scheme run its normal kernel; we only post-QDQ.
-        # Important: pass bias=None so it doesn't get added before QDQ,
-        # then add bias after the QDQ (bias should not be part of the
-        # "quantized communication" payload in the real TP model).
-        out = self.inner.apply_weights(layer, x, bias=None)
-        out = _qdq_partial_sums(out, self.partial_sum_quant_args)
+    def apply_weights(layer, x, bias=None):
+        # Inner kernel runs without bias (bias is not part of the "quantized
+        # communication" payload); we add bias after QDQ.
+        out = _orig_apply_weights(layer, x, bias=None)
+        out = _qdq_partial_sums(out, partial_sum_quant_args)
         if bias is not None:
             out = out + bias
         return out
+
+    inner_scheme.apply_weights = apply_weights
+    inner_scheme._partial_sum_num_ranks = num_ranks
+    inner_scheme._partial_sum_quant_args = partial_sum_quant_args
+    return inner_scheme
 
 
 # ─── UnquantizedLinearMethod wrapper ───────────────────────────────────────
