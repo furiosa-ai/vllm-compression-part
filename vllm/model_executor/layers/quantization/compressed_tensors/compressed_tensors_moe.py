@@ -125,38 +125,6 @@ class CompressedTensorsMoEMethod(FusedMoEMethodBase):
         layer: torch.nn.Module,
         layer_name: str,
     ) -> FusedMoEMethodBase:
-        method = CompressedTensorsMoEMethod._resolve_moe_method(
-            quant_config, layer, layer_name
-        )
-
-        # FusedMoE partial_sum wrap. The fused MoE kernel produces the
-        # rank-local partial sum; we QDQ that before FusedMoE's TP
-        # all-reduce, emulating quantized communication on the all-reduce
-        # boundary.
-        ps_cfg = quant_config._partial_sum_config_for(layer_name)
-        if ps_cfg is not None and method is not None:
-            from vllm.model_executor.layers.quantization.compressed_tensors.schemes.compressed_tensors_partial_sum import (  # noqa: E501
-                make_moe_partial_sum_wrapper,
-            )
-
-            inner_name = type(method).__name__
-            method = make_moe_partial_sum_wrapper(
-                method, ps_cfg.num_ranks, ps_cfg.quant_args
-            )
-            logger.info(
-                "PartialSum[moe]: %s wrapped over %s (num_ranks=%d)",
-                layer_name,
-                inner_name,
-                ps_cfg.num_ranks,
-            )
-        return method
-
-    @staticmethod
-    def _resolve_moe_method(
-        quant_config: "CompressedTensorsConfig",  # type: ignore # noqa E501
-        layer: torch.nn.Module,
-        layer_name: str,
-    ) -> FusedMoEMethodBase:
         # FusedMoE was made by combining multiple Linears so need to
         # make sure quantization config for Linear can target it
         quant_config._add_fused_moe_to_target_scheme_map()
