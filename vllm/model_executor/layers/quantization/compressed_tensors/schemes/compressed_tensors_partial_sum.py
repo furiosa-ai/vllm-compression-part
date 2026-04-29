@@ -2,17 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 """
-Partial-sum NVFP4+ QDQ wrappers (hardcoded for K-EXAONE).
+Partial-sum NVFP4+ QDQ helpers (hardcoded for furiosa-ai-dev/K-EXAONE-236B-A23B-NVFP4A16).
 
-Per-group dynamic fake-quantize on the rank-local matmul output before
-vLLM's ``tensor_model_parallel_all_reduce``, on layers matching
-``_PARTIAL_SUM_TARGETS``. Quant shape is fixed: symmetric FP4 E2M1,
-group_size=16, per-group BF16 scale.
 """
 
 from __future__ import annotations
-
-from typing import Any
 
 import regex as re
 import torch
@@ -33,7 +27,7 @@ _PARTIAL_SUM_TARGETS: tuple[re.Pattern[str], ...] = (
 )
 
 
-def _is_partial_sum_target(prefix: str | None) -> bool:
+def is_partial_sum_target(prefix: str | None) -> bool:
     if prefix is None:
         return False
     return any(p.fullmatch(prefix) for p in _PARTIAL_SUM_TARGETS)
@@ -90,7 +84,7 @@ def _qdq_nvfp4plus_fake(partial_results: torch.Tensor) -> torch.Tensor:
     return torch.empty_like(partial_results)
 
 
-def _qdq_partial_sums(partial_results: torch.Tensor) -> torch.Tensor:
+def qdq_partial_sums(partial_results: torch.Tensor) -> torch.Tensor:
     last_dim = partial_results.shape[-1]
     if last_dim % _GROUP_SIZE != 0:
         logger.warning_once(
@@ -101,65 +95,3 @@ def _qdq_partial_sums(partial_results: torch.Tensor) -> torch.Tensor:
         )
         return partial_results
     return torch.ops.vllm_partial_sum.qdq_nvfp4plus(partial_results)
-
-
-def install_partial_sum_linear(
-    layer: Any, method: Any, prefix: str | None
-) -> None:
-    if not _is_partial_sum_target(prefix):
-        return
-
-    scheme = getattr(layer, "scheme", None)
-    if scheme is not None:
-        target, fn_name = scheme, "apply_weights"
-    else:
-        target, fn_name = method, "apply"
-    _orig = getattr(target, fn_name)
-
-    # Bias is added after QDQ — it is not part of the "quantized
-    # communication" payload that the all-reduce sees.
-    def wrapped(layer_, x, bias=None):
-        out = _orig(layer_, x, bias=None)
-        out = _qdq_partial_sums(out)
-        if bias is not None:
-            out = out + bias
-        return out
-
-    setattr(target, fn_name, wrapped)
-    logger.info_once(
-        "PartialSum[linear]: wrapping %s over %s",
-        prefix,
-        type(target).__name__,
-    )
-
-
-def install_partial_sum_moe(method: Any, prefix: str | None) -> None:
-    if not _is_partial_sum_target(prefix) or method is None:
-        return
-
-    _orig_apply = method.apply
-    _orig_apply_monolithic = getattr(method, "apply_monolithic", None)
-
-    def _post_qdq(out):
-        if isinstance(out, tuple):
-            head, body = out
-            return (head, _qdq_partial_sums(body))
-        return _qdq_partial_sums(out)
-
-    def apply(*args, **kwargs):
-        return _post_qdq(_orig_apply(*args, **kwargs))
-
-    method.apply = apply
-
-    if _orig_apply_monolithic is not None:
-
-        def apply_monolithic(*args, **kwargs):
-            return _post_qdq(_orig_apply_monolithic(*args, **kwargs))
-
-        method.apply_monolithic = apply_monolithic
-
-    logger.info_once(
-        "PartialSum[moe]: wrapping %s over %s",
-        prefix,
-        type(method).__name__,
-    )

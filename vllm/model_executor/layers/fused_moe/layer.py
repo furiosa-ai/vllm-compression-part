@@ -1542,8 +1542,13 @@ class FusedMoE(CustomOp):
         """
         if self.must_reduce_shared_expert_outputs():
             return final_hidden_states
-        else:
-            return tensor_model_parallel_all_reduce(final_hidden_states)
+        if getattr(self, "_partial_sum", False):
+            from vllm.model_executor.layers.quantization.compressed_tensors.schemes.compressed_tensors_partial_sum import (  # noqa: E501
+                qdq_partial_sums,
+            )
+
+            final_hidden_states = qdq_partial_sums(final_hidden_states)
+        return tensor_model_parallel_all_reduce(final_hidden_states)
 
     def forward_native(
         self,
