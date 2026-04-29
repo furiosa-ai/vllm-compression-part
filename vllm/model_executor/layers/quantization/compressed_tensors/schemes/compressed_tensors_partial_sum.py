@@ -2,8 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 """
-Partial-sum NVFP4+ QDQ helpers (hardcoded for furiosa-ai-dev/K-EXAONE-236B-A23B-NVFP4A16).
-
+Partial-sum NVFP4+ QDQ helpers
+(hardcoded for furiosa-ai-dev/K-EXAONE-236B-A23B-NVFP4A16).
 """
 
 from __future__ import annotations
@@ -63,9 +63,7 @@ def _qdq_nvfp4plus(partial_results: torch.Tensor) -> torch.Tensor:
     last_dim = original_shape[-1]
 
     x_fp32 = partial_results.to(torch.float32)
-    grouped = x_fp32.reshape(
-        *original_shape[:-1], last_dim // _GROUP_SIZE, _GROUP_SIZE
-    )
+    grouped = x_fp32.reshape(*original_shape[:-1], last_dim // _GROUP_SIZE, _GROUP_SIZE)
 
     amax = grouped.abs().amax(dim=-1, keepdim=True)
     eps = torch.finfo(torch.float32).eps
@@ -88,8 +86,7 @@ def qdq_partial_sums(partial_results: torch.Tensor) -> torch.Tensor:
     last_dim = partial_results.shape[-1]
     if last_dim % _GROUP_SIZE != 0:
         logger.warning_once(
-            "PartialSum: last dim %d not divisible by group_size %d; "
-            "skipping QDQ.",
+            "PartialSum: last dim %d not divisible by group_size %d; skipping QDQ.",
             last_dim,
             _GROUP_SIZE,
         )
