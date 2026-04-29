@@ -55,6 +55,9 @@ from vllm.model_executor.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsW8A16Fp8,
     CompressedTensorsWNA16,
 )
+from vllm.model_executor.layers.quantization.compressed_tensors.schemes.compressed_tensors_partial_sum import (  # noqa: E501
+    is_partial_sum_target,
+)
 from vllm.model_executor.layers.quantization.compressed_tensors.transform.linear import (  # noqa: E501
     CompressedTensorsLinearTransformMethod,
     get_linear_transform_schemes,
@@ -175,6 +178,8 @@ class CompressedTensorsConfig(QuantizationConfig):
             if quant_scheme is not None:
                 layer.scheme = quant_scheme
                 quant_method = CompressedTensorsLinearMethod(self)
+            if is_partial_sum_target(prefix):
+                layer._partial_sum = True
 
             # choose transform method
             if any((input_tfms, output_tfms)):
@@ -188,6 +193,8 @@ class CompressedTensorsConfig(QuantizationConfig):
         if isinstance(layer, Attention):
             return CompressedTensorsKVCacheMethod(self)
         if isinstance(layer, FusedMoE):
+            if is_partial_sum_target(prefix):
+                layer._partial_sum = True
             return CompressedTensorsMoEMethod.get_moe_method(
                 self, layer, layer_name=prefix
             )
