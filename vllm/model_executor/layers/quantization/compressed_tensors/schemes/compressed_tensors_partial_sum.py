@@ -103,30 +103,37 @@ def _qdq_partial_sums(partial_results: torch.Tensor) -> torch.Tensor:
     return torch.ops.vllm_partial_sum.qdq_nvfp4plus(partial_results)
 
 
-def _maybe_wrap_partial_sum_scheme(scheme: Any, prefix: str | None) -> None:
+def install_partial_sum_linear(
+    layer: Any, method: Any, prefix: str | None
+) -> None:
     if not _is_partial_sum_target(prefix):
         return
 
-    _orig_apply_weights = scheme.apply_weights
+    scheme = getattr(layer, "scheme", None)
+    if scheme is not None:
+        target, fn_name = scheme, "apply_weights"
+    else:
+        target, fn_name = method, "apply"
+    _orig = getattr(target, fn_name)
 
     # Bias is added after QDQ — it is not part of the "quantized
     # communication" payload that the all-reduce sees.
-    def apply_weights(layer, x, bias=None):
-        out = _orig_apply_weights(layer, x, bias=None)
+    def wrapped(layer_, x, bias=None):
+        out = _orig(layer_, x, bias=None)
         out = _qdq_partial_sums(out)
         if bias is not None:
             out = out + bias
         return out
 
-    scheme.apply_weights = apply_weights
+    setattr(target, fn_name, wrapped)
     logger.info_once(
         "PartialSum[linear]: wrapping %s over %s",
         prefix,
-        type(scheme).__name__,
+        type(target).__name__,
     )
 
 
-def _maybe_wrap_partial_sum_moe(method: Any, prefix: str | None) -> None:
+def install_partial_sum_moe(method: Any, prefix: str | None) -> None:
     if not _is_partial_sum_target(prefix) or method is None:
         return
 
