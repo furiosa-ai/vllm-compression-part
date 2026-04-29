@@ -37,16 +37,6 @@ from compressed_tensors.quantization import (
     QuantizationArgs,
     QuantizationStrategy,
 )
-from compressed_tensors.quantization.lifecycle.forward import fake_quantize
-from compressed_tensors.quantization.quant_args import (
-    FP4_E2M1_DATA,
-    FP8_E4M3_DATA,
-)
-from compressed_tensors.quantization.utils import (
-    compute_dynamic_scales_and_zp,
-    generate_gparam,
-    is_fp4,
-)
 
 from vllm.logger import init_logger
 
@@ -60,56 +50,144 @@ __all__ = [
 
 
 # ─── QDQ helper ────────────────────────────────────────────────────────────
+#
+# Inline NVFP4+ QDQ (FP4 E2M1 grid + per-group BF16 scale, group_size=16,
+# symmetric, no global scale). Properties verified by
+# ``test_qdq_nvfp4plus.py``.
+
+# Positive FP4 E2M1 magnitudes.
+_FP4_POS_MAGS: tuple[float, ...] = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
+_FP4_MAX = 6.0
+
+# Bit mask that zeroes the lower 16 bits of an fp32 word -- equivalent to
+# truncating the value to the bf16 grid. Used in ``_to_bf16_grid``.
+_BF16_TRUNC_MASK = -65536  # = 0xFFFF0000 as a signed int32
+
+
+def _to_bf16_grid(x: torch.Tensor) -> torch.Tensor:
+    """
+    Snap each element of ``x`` (fp32) onto the BF16 representable grid via
+    bit-mask truncation. The mask is a Python int so no GPU tensor is
+    allocated inside the function (required for CUDA-graph capture).
+    """
+    return (x.contiguous().view(torch.int32) & _BF16_TRUNC_MASK).view(torch.float32)
+
+
+def _snap_to_fp4_grid(x: torch.Tensor) -> torch.Tensor:
+    """
+    Round each element of ``x`` (already in [-6, 6]) to the nearest FP4
+    E2M1 grid value. Scalar constants are passed as Python floats so no
+    temporary tensors are allocated (required for CUDA-graph capture).
+    """
+    sign = torch.sign(x)
+    a = x.abs()
+    # Walk from the largest magnitude inward; each torch.where pins down
+    # the target magnitude for elements in that band. Boundaries are the
+    # midpoints of consecutive FP4 magnitudes.
+    out = torch.where(a > 5.0, 6.0, a)
+    out = torch.where((a >= 3.5) & (a <= 5.0), 4.0, out)
+    out = torch.where((a > 2.5) & (a < 3.5), 3.0, out)
+    out = torch.where((a >= 1.75) & (a <= 2.5), 2.0, out)
+    out = torch.where((a > 1.25) & (a < 1.75), 1.5, out)
+    out = torch.where((a >= 0.75) & (a <= 1.25), 1.0, out)
+    out = torch.where((a > 0.25) & (a < 0.75), 0.5, out)
+    out = torch.where(a <= 0.25, 0.0, out)
+    return sign * out
+
+
+def _qdq_nvfp4plus_inline(
+    partial_results: torch.Tensor,
+    group_size: int,
+) -> torch.Tensor:
+    """
+    Pure-tensor NVFP4+ QDQ over the last dim. Used inside the custom op,
+    not directly. ``group_size`` must divide the last dim.
+    """
+    original_shape = partial_results.shape
+    original_dtype = partial_results.dtype
+    last_dim = original_shape[-1]
+
+    x_fp32 = partial_results.to(torch.float32)
+    grouped = x_fp32.reshape(*original_shape[:-1], last_dim // group_size, group_size)
+
+    amax = grouped.abs().amax(dim=-1, keepdim=True)
+    eps = torch.finfo(torch.float32).eps
+    scale_fp32 = torch.clamp(amax / _FP4_MAX, min=eps)
+    scale_bf16 = _to_bf16_grid(scale_fp32)
+
+    x_scaled = torch.clamp(grouped / scale_bf16, min=-_FP4_MAX, max=_FP4_MAX)
+    x_q = _snap_to_fp4_grid(x_scaled)
+    x_dq = x_q * scale_bf16
+
+    return x_dq.reshape(original_shape).to(original_dtype)
+
+
+# ─── Custom op registration ────────────────────────────────────────────────
+#
+# Expose ``_qdq_nvfp4plus_inline`` to vLLM's compile pipeline as a single
+# opaque op so dynamo treats it as a black box (no inductor trace into the
+# body, eager and compile bit-identical). ``mutates_args=()`` declares
+# purity so inductor can still CSE/DCE around the call.
+
+@torch.library.custom_op(
+    "vllm_partial_sum::qdq_nvfp4plus",
+    mutates_args=(),
+)
+def _qdq_nvfp4plus_op(
+    partial_results: torch.Tensor,
+    group_size: int,
+) -> torch.Tensor:
+    return _qdq_nvfp4plus_inline(partial_results, group_size)
+
+
+@_qdq_nvfp4plus_op.register_fake
+def _qdq_nvfp4plus_op_fake(
+    partial_results: torch.Tensor,
+    group_size: int,
+) -> torch.Tensor:
+    return torch.empty_like(partial_results)
+
 
 def _qdq_partial_sums(
     partial_results: torch.Tensor,
     quant_args: QuantizationArgs,
 ) -> torch.Tensor:
     """
-    Apply per-group dynamic QDQ along the last dim of ``partial_results``.
-
-    Shape-agnostic (flattens all but last dim for scale computation).
-
-    NOTE: the compressed_tensors helper calls ``.item()`` internally, which
-    Dynamo cannot trace in fullgraph mode. Callers should run with
-    ``TORCHDYNAMO_CAPTURE_SCALAR_OUTPUTS=1`` or ``--enforce-eager``.
+    Apply NVFP4+ per-group dynamic QDQ along the last dim of
+    ``partial_results``. Falls back to passing the input through unchanged
+    (with a warning) if ``quant_args`` is not the NVFP4+ shape -- group
+    strategy, FP4 type, symmetric, group_size dividing the last dim.
     """
-    original_shape = partial_results.shape
-    original_dtype = partial_results.dtype
+    if not (
+        quant_args.strategy == QuantizationStrategy.GROUP
+        and quant_args.type == "float"
+        and quant_args.num_bits == 4
+        and quant_args.symmetric
+    ):
+        logger.warning_once(
+            "PartialSum: torch.compile-safe inline QDQ only handles "
+            "symmetric FP4 GROUP. Got strategy=%s type=%s num_bits=%s "
+            "symmetric=%s -- skipping QDQ.",
+            quant_args.strategy,
+            quant_args.type,
+            quant_args.num_bits,
+            quant_args.symmetric,
+        )
+        return partial_results
 
-    flat = partial_results.reshape(-1, original_shape[-1])
+    last_dim = partial_results.shape[-1]
+    group_size = int(quant_args.group_size)
 
-    global_scale = None
-    if quant_args.strategy == QuantizationStrategy.TENSOR_GROUP:
-        if is_fp4(quant_args):
-            global_scale = generate_gparam(
-                updated_min_val=flat.min(),
-                updated_max_val=flat.max(),
-                scale_data=FP8_E4M3_DATA,
-                quant_data=FP4_E2M1_DATA,
-            )
-        else:
-            logger.warning_once(
-                "PartialSum: TENSOR_GROUP with %d-bit %s not supported for "
-                "global_scale computation; only FP4 is.",
-                quant_args.num_bits,
-                quant_args.type,
-            )
+    if last_dim % group_size != 0:
+        logger.warning_once(
+            "PartialSum: last dim %d not divisible by group_size %d; "
+            "skipping QDQ.",
+            last_dim,
+            group_size,
+        )
+        return partial_results
 
-    scale, zero_point = compute_dynamic_scales_and_zp(
-        value=flat,
-        args=quant_args,
-        module=None,
-        global_scale=global_scale,
-    )
-    qdq = fake_quantize(
-        x=flat,
-        scale=scale,
-        zero_point=zero_point,
-        args=quant_args,
-        global_scale=global_scale,
-    )
-    return qdq.reshape(original_shape).to(original_dtype)
+    return torch.ops.vllm_partial_sum.qdq_nvfp4plus(partial_results, group_size)
 
 
 # ─── Scheme post-hook (quantized Linear) ───────────────────────────────────
