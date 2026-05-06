@@ -4,28 +4,23 @@
 """
 NVFP8 W8A8 / W8A16 scheme for compressed-tensors models.
 
-Checkpoint layout:
+Checkpoint layout (W8A8):
   - weight:              float8_e4m3fn  (FP8 quantized data)
-  - weight_scale:        float8_e4m3fn  (combined = global_scale * local_scale)
+  - weight_scale:        float8_e4m3fn  (per-group-16 scale, shape: [out, in//16])
   - weight_global_scale: float32        (per-tensor global scale)
+  - input_global_scale:  float32        (per-tensor static calibrated global scale)
 
 At load time, weights are dequantized via compressed_tensors.dequantize().
-At inference time (W8A8), activations are dynamically fake-quantized
-(TENSOR_GROUP, group_size=16) before a standard torch.matmul.
+At inference time (W8A8), per-group local scales are computed dynamically but
+the global scale uses the static calibrated input_global_scale from checkpoint.
 """
 
-import math
 from collections.abc import Callable
 
 import torch
-from compressed_tensors.quantization import QuantizationArgs, QuantizationStrategy
+from compressed_tensors.quantization import QuantizationArgs
 from compressed_tensors.quantization.lifecycle.forward import dequantize, fake_quantize
 from compressed_tensors.quantization.utils import compute_dynamic_scales_and_zp
-from compressed_tensors.quantization.utils.helpers import (
-    FP8_E4M3_DATA,
-    FP4_E2M1_DATA,
-    generate_gparam,
-)
 
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.compressed_tensors.schemes import (
@@ -117,6 +112,14 @@ class CompressedTensorsW8A8NVFp8(CompressedTensorsScheme):
         )
         layer.register_parameter("weight_global_scale", weight_global_scale)
 
+        # Static calibrated global scale for activations (W8A8 only).
+        if self.input_quant is not None:
+            input_global_scale = PerTensorScaleParameter(
+                data=torch.empty(len(output_partition_sizes), dtype=torch.float32),
+                weight_loader=weight_loader,
+            )
+            layer.register_parameter("input_global_scale", input_global_scale)
+
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         # global_scale may have shape (num_partitions,) from QKV merge;
         # reduce to scalar for correct broadcasting in dequantize.
@@ -132,20 +135,11 @@ class CompressedTensorsW8A8NVFp8(CompressedTensorsScheme):
         del layer.weight_scale
         del layer.weight_global_scale
 
-    def _compute_activation_global_scale(self, x: torch.Tensor) -> torch.Tensor:
-        """Compute dynamic global_scale for TENSOR_GROUP activation quantization."""
-        gs = self.group_size
-        reshaped = x.unflatten(-1, (math.ceil(x.shape[-1] / gs), gs))
-        min_val = torch.amin(reshaped, dim=-1)
-        max_val = torch.amax(reshaped, dim=-1)
-        quant_data = (
-            FP8_E4M3_DATA if self.input_quant.num_bits == 8 else FP4_E2M1_DATA
-        )
-        return generate_gparam(
-            min_val.amin().reshape(1),
-            max_val.amax().reshape(1),
-            quant_data=quant_data,
-        )
+        if self.input_quant is not None:
+            layer.input_global_scale = torch.nn.Parameter(
+                layer.input_global_scale.data.max().reshape(1).to(torch.float32),
+                requires_grad=False,
+            )
 
     def apply_weights(
         self,
@@ -155,15 +149,17 @@ class CompressedTensorsW8A8NVFp8(CompressedTensorsScheme):
     ) -> torch.Tensor:
         if self.input_quant is not None:
             scale, zero_point = compute_dynamic_scales_and_zp(
-                value=x, args=self.input_quant, module=None, global_scale=None
+                value=x,
+                args=self.input_quant,
+                module=None,
+                global_scale=layer.input_global_scale,
             )
-            global_scale = self._compute_activation_global_scale(x)
             qdq_input = fake_quantize(
                 x=x,
                 scale=scale,
                 zero_point=zero_point,
                 args=self.input_quant,
-                global_scale=global_scale,
+                global_scale=layer.input_global_scale,
             ).to(x.dtype)
         else:
             # W8A16: weights already dequantized at load time, pass through
