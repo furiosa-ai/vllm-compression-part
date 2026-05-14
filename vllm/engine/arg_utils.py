@@ -40,6 +40,7 @@ from vllm.config import (
     DeviceConfig,
     ECTransferConfig,
     EPLBConfig,
+    KVCacheQuantConfig,
     KVEventsConfig,
     KVTransferConfig,
     LoadConfig,
@@ -541,6 +542,12 @@ class EngineArgs:
 
     kv_transfer_config: KVTransferConfig | None = None
     kv_events_config: KVEventsConfig | None = None
+    kv_cache_quant_config: KVCacheQuantConfig | None = None
+    # User-facing CLI flags that assemble into kv_cache_quant_config. Default
+    # method="none" means no KV-cache quantization (kv_cache_quant_config
+    # stays None). "nvfp4" requires kv_cache_quant_global_scales_path.
+    kv_cache_quant_method: str = "none"
+    kv_cache_quant_global_scales_path: str = ""
 
     ec_transfer_config: ECTransferConfig | None = None
 
@@ -1167,6 +1174,30 @@ class EngineArgs:
         )
         vllm_group.add_argument("--kv-events-config", **vllm_kwargs["kv_events_config"])
         vllm_group.add_argument(
+            "--kv-cache-quant-method",
+            type=str,
+            default=EngineArgs.kv_cache_quant_method,
+            choices=["none", "nvfp4"],
+            help=(
+                "KV-cache fake-quantization method. "
+                "'none' (default) disables KV-cache quantization. "
+                "'nvfp4' applies per-tensor FP32 + per-group FP8 + per-element "
+                "FP4 E2M1 fake-quant on K and V at each attention step, using "
+                "per-layer global scales loaded from "
+                "--kv-cache-quant-global-scales-path."
+            ),
+        )
+        vllm_group.add_argument(
+            "--kv-cache-quant-global-scales-path",
+            type=str,
+            default=EngineArgs.kv_cache_quant_global_scales_path,
+            help=(
+                "Path to a .pt file containing per-layer NVFP4 global scales "
+                "with keys 'gs_K' / 'gs_V' (fp32 tensors of shape "
+                "(num_layers,)). Required when --kv-cache-quant-method=nvfp4."
+            ),
+        )
+        vllm_group.add_argument(
             "--ec-transfer-config", **vllm_kwargs["ec_transfer_config"]
         )
         vllm_group.add_argument(
@@ -1733,6 +1764,21 @@ class EngineArgs:
             enable_logging_iteration_details=self.enable_logging_iteration_details,
         )
 
+        # Assemble KVCacheQuantConfig from the two CLI flags. If
+        # kv_cache_quant_config was already provided directly (e.g. by the
+        # Python LLM(...) constructor), that takes precedence and the CLI
+        # flags are ignored.
+        if (
+            self.kv_cache_quant_config is None
+            and self.kv_cache_quant_method != "none"
+        ):
+            self.kv_cache_quant_config = KVCacheQuantConfig(
+                method=self.kv_cache_quant_method,
+                global_scales_path=(
+                    self.kv_cache_quant_global_scales_path or None
+                ),
+            )
+
         # Compilation config overrides
         compilation_config = copy.deepcopy(self.compilation_config)
         if self.cudagraph_capture_sizes is not None:
@@ -1766,6 +1812,7 @@ class EngineArgs:
             compilation_config=compilation_config,
             kv_transfer_config=self.kv_transfer_config,
             kv_events_config=self.kv_events_config,
+            kv_cache_quant_config=self.kv_cache_quant_config,
             ec_transfer_config=self.ec_transfer_config,
             profiler_config=self.profiler_config,
             additional_config=self.additional_config,
