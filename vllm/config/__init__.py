@@ -11,6 +11,7 @@ from vllm.config.compilation import (
 )
 from vllm.config.device import DeviceConfig
 from vllm.config.ec_transfer import ECTransferConfig
+from vllm.config.kv_cache_quant import KVCacheQuantConfig
 from vllm.config.kv_events import KVEventsConfig
 from vllm.config.kv_transfer import KVTransferConfig
 from vllm.config.load import LoadConfig
@@ -63,6 +64,8 @@ __all__ = [
     "DeviceConfig",
     # From vllm.config.ec_transfer
     "ECTransferConfig",
+    # From vllm.config.kv_cache_quant
+    "KVCacheQuantConfig",
     # From vllm.config.kv_events
     "KVEventsConfig",
     # From vllm.config.kv_transfer

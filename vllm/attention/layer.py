@@ -320,6 +320,14 @@ class Attention(nn.Module, AttentionLayerBase):
         # Initialize KV cache quantization attributes
         _init_kv_cache_quant(self, quant_config, prefix)
 
+        # KV NVFP4 fake-quant for accuracy studies.
+        # No-op unless LLM(kv_cache_quant_config=...) was set (or the equivalent
+        # `vllm serve --kv-cache-quant-method nvfp4 ...` CLI flags were passed).
+        from vllm.model_executor.layers.quantization.kv_fake_quant import (
+            attach_kv_quant_to_layer,
+        )
+        attach_kv_quant_to_layer(self, prefix)
+
         # for attn backends supporting query quantization
         self.query_quant = None
         if self.impl.supports_quant_query_input and self.kv_cache_dtype.startswith(
@@ -357,6 +365,11 @@ class Attention(nn.Module, AttentionLayerBase):
         """
         if self.calculate_kv_scales:
             torch.ops.vllm.maybe_calc_kv_scales(query, key, value, self.layer_name)
+        if getattr(self, "kv_quant_state", None) is not None:
+            from vllm.model_executor.layers.quantization.kv_fake_quant import (
+                apply_kv_quant,
+            )
+            key, value = apply_kv_quant(self, key, value)
         output_dtype = query.dtype
         if self.query_quant is not None:
             # quantizing with a simple torch operation enables
