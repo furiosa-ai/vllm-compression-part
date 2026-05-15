@@ -11,6 +11,7 @@ Each worker lazy-loads the scales (with caching) inside
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 
 
@@ -49,7 +50,20 @@ class KVCacheQuantConfig:
         if not self.global_scales_path:
             raise ValueError(
                 "method='nvfp4' requires global_scales_path "
-                "(a .pt file with per-layer 'gs_K' / 'gs_V' fp32 tensors)"
+                "(a .pt file with per-layer 'gs_K' / 'gs_V' fp32 tensors). "
+                "Pass --kv-cache-quant-global-scales-path <path> on the CLI, "
+                "or kv_cache_quant_config=KVCacheQuantConfig(..., "
+                "global_scales_path=...) to LLM()."
+            )
+        # Fail fast at config-construction time rather than later when a
+        # worker tries to torch.load(); the runtime error path bubbles
+        # through engine startup and is harder to debug.
+        if not os.path.isfile(self.global_scales_path):
+            raise FileNotFoundError(
+                f"global_scales_path {self.global_scales_path!r} does not "
+                f"exist (or is not a regular file). Run the calibration "
+                f"utility under K-EXAONE-evaluation/kv_cache_quantization/ "
+                f"first, or fix the path."
             )
 
     def is_active(self) -> bool:
