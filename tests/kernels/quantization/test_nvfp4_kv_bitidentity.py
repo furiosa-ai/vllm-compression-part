@@ -105,14 +105,41 @@ def _bit_equal(a: torch.Tensor, b: torch.Tensor) -> bool:
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("x,expected", [
-    # Exact grid points → no-op
-    (0.0, 0.0), (0.5, 0.5), (1.0, 1.0), (1.5, 1.5), (2.0, 2.0),
-    (3.0, 3.0), (4.0, 4.0), (6.0, 6.0),
-    # Midpoints (round HALF toward smaller magnitude — compressed_tensors style)
+    # ---- Min/Max code: signed extremes of the FP4 E2M1 grid ----
+    # Max Code (largest representable magnitude) = ±6.0
+    (6.0, 6.0), (-6.0, -6.0),
+    # Min Code (smallest non-zero magnitude) = ±0.5
+    (0.5, 0.5), (-0.5, -0.5),
+    # Zero (both signed zeros must map to 0.0)
+    (0.0, 0.0), (-0.0, -0.0),
+
+    # ---- Exact grid points (no-op) ----
+    (1.0, 1.0), (1.5, 1.5), (2.0, 2.0), (3.0, 3.0), (4.0, 4.0),
+    (-1.0, -1.0), (-1.5, -1.5), (-2.0, -2.0), (-3.0, -3.0), (-4.0, -4.0),
+
+    # ---- Midpoint tie-breaking (round HALF toward smaller magnitude) ----
     (0.25, 0.0), (1.25, 1.0), (2.5, 2.0), (5.0, 4.0),
     (-0.25, -0.0), (-1.25, -1.0), (-2.5, -2.0), (-5.0, -4.0),
-    # Near-misses (asymmetric intervals)
-    (0.75, 1.0), (1.75, 2.0), (3.5, 4.0),
+
+    # ---- Just below each midpoint (must round DOWN) ----
+    (0.2499, 0.0), (1.2499, 1.0), (2.4999, 2.0), (4.9999, 4.0),
+    # ---- Just above each midpoint (must round UP) ----
+    (0.2501, 0.5), (1.2501, 1.5), (2.5001, 3.0), (5.0001, 6.0),
+
+    # ---- Symmetric-interval boundaries (close on both sides) ----
+    # [0.75, 1.25] → 1.0;  [1.75, 2.5] → 2.0;  [3.5, 5.0] → 4.0
+    (0.75, 1.0), (1.25, 1.0),
+    (1.75, 2.0),
+    (3.5, 4.0),
+
+    # ---- Near-misses just outside symmetric intervals ----
+    (0.7499, 0.5), (1.2501, 1.5),
+    (1.7499, 1.5), (2.5001, 3.0),
+    (3.4999, 3.0), (5.0001, 6.0),
+
+    # ---- Just past Max Code: clamp at 6.0 (round_fp4 itself clips) ----
+    (6.0001, 6.0), (10.0, 6.0), (1e6, 6.0),
+    (-6.0001, -6.0), (-10.0, -6.0), (-1e6, -6.0),
 ])
 def test_fp4_round_at_boundary(x, expected):
     out = round_fp4(torch.tensor([x], dtype=torch.float32))
@@ -263,11 +290,23 @@ if __name__ == "__main__":
     import sys
 
     BOUNDARY_CASES = [
-        (0.0, 0.0), (0.5, 0.5), (1.0, 1.0), (1.5, 1.5), (2.0, 2.0),
-        (3.0, 3.0), (4.0, 4.0), (6.0, 6.0),
+        # Min/Max code + zero
+        (6.0, 6.0), (-6.0, -6.0), (0.5, 0.5), (-0.5, -0.5),
+        (0.0, 0.0), (-0.0, -0.0),
+        # Exact grid points
+        (1.0, 1.0), (1.5, 1.5), (2.0, 2.0), (3.0, 3.0), (4.0, 4.0),
+        (-1.0, -1.0), (-1.5, -1.5), (-2.0, -2.0), (-3.0, -3.0), (-4.0, -4.0),
+        # Midpoint tie-breaking
         (0.25, 0.0), (1.25, 1.0), (2.5, 2.0), (5.0, 4.0),
         (-0.25, -0.0), (-1.25, -1.0), (-2.5, -2.0), (-5.0, -4.0),
+        # Just below / above each midpoint
+        (0.2499, 0.0), (1.2499, 1.0), (2.4999, 2.0), (4.9999, 4.0),
+        (0.2501, 0.5), (1.2501, 1.5), (2.5001, 3.0), (5.0001, 6.0),
+        # Symmetric-interval boundaries
         (0.75, 1.0), (1.75, 2.0), (3.5, 4.0),
+        # Just past Max Code → clamp
+        (6.0001, 6.0), (10.0, 6.0), (1e6, 6.0),
+        (-6.0001, -6.0), (-10.0, -6.0), (-1e6, -6.0),
     ]
 
     passed = failed = 0
