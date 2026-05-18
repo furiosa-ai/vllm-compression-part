@@ -1177,13 +1177,18 @@ class EngineArgs:
             "--kv-cache-quant-method",
             type=str,
             default=EngineArgs.kv_cache_quant_method,
-            choices=["none", "nvfp4"],
+            choices=["none", "nvfp4", "nvfp4_plus"],
             help=(
                 "KV-cache fake-quantization method. "
                 "'none' (default) disables KV-cache quantization. "
                 "'nvfp4' applies per-tensor FP32 + per-group FP8 + per-element "
                 "FP4 E2M1 fake-quant on K and V at each attention step, using "
                 "per-layer global scales loaded from "
+                "--kv-cache-quant-global-scales-path. "
+                "'nvfp4_plus' applies per-group FP32 + per-element FP4 E2M1 "
+                "fake-quant with NO per-tensor global scale and NO "
+                "calibration step (per-group scale is computed on the fly). "
+                "When using 'nvfp4_plus', do NOT pass "
                 "--kv-cache-quant-global-scales-path."
             ),
         )
@@ -1194,7 +1199,8 @@ class EngineArgs:
             help=(
                 "Path to a .pt file containing per-layer NVFP4 global scales "
                 "with keys 'gs_K' / 'gs_V' (fp32 tensors of shape "
-                "(num_layers,)). Required when --kv-cache-quant-method=nvfp4."
+                "(num_layers,)). Required when --kv-cache-quant-method=nvfp4. "
+                "MUST be unset when --kv-cache-quant-method=nvfp4_plus."
             ),
         )
         vllm_group.add_argument(

@@ -1,18 +1,26 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""NVFP4 fake-quantization kernel for KV cache.
+"""NVFP4 and NVFP4+ fake-quantization kernels for KV cache.
 
-``@torch.library.custom_op`` op that appears by name in inductor's FX graph
-dump (``computation_graph.py``):
+Two ``@torch.library.custom_op`` ops, each appearing by name in inductor's
+FX graph dump (``computation_graph.py``):
 
     vllm_kv_quant::fake_quantize_dequantize_nvfp4(x, global_scale) -> Tensor
+    vllm_kv_quant::fake_quantize_dequantize_nvfp4_plus(x) -> Tensor
 
-Plus the high-level shape-handling wrapper:
+Plus the matching high-level shape-handling wrappers:
 
     fake_quantize_nvfp4(x, num_kv_heads, head_dim, global_scale) -> Tensor
+    fake_quantize_nvfp4_plus(x, num_kv_heads, head_dim) -> Tensor
 
-The custom_op is opaque to torch.compile — the compiler doesn't try to
+NVFP4 = per-tensor FP32 global scale (calibrated) × per-group FP8 E4M3
+scale × per-element FP4 E2M1, group_size=16.
+
+NVFP4+ = per-group FP32 scale (NO global scale, NO FP8 rounding on the
+scale, NO calibration needed) × per-element FP4 E2M1, group_size=16.
+
+Each custom_op is opaque to torch.compile — the compiler doesn't try to
 inline or rewrite its body. Its name appears verbatim in inductor's
 ``computation_graph.py``, which is what graph-verification tooling greps for.
 """
@@ -191,4 +199,77 @@ def fake_quantize_nvfp4(
     orig_dtype = x.dtype
     x4 = _to_bnhtd(x, num_kv_heads, head_dim)
     out = torch.ops.vllm_kv_quant.fake_quantize_dequantize_nvfp4(x4, global_scale)
+    return _from_bnhtd(out, orig_shape).to(orig_dtype)
+
+
+# ---------------------------------------------------------------------------
+# NVFP4+: per-group FP32 scale, per-element FP4 E2M1. No global scale.
+# Group size matches NVFP4 (16); the only differences from NVFP4 are:
+#   * no per-tensor FP32 global scale (no calibration step required)
+#   * per-group scale stays FP32 (NOT rounded to FP8 E4M3)
+# ---------------------------------------------------------------------------
+
+_NVFP4_PLUS_GROUP_SIZE = 16
+
+
+@torch.library.custom_op(
+    "vllm_kv_quant::fake_quantize_dequantize_nvfp4_plus", mutates_args=()
+)
+def _fake_quantize_dequantize_nvfp4_plus(data: torch.Tensor) -> torch.Tensor:
+    """NVFP4+ quant-dequant on (B, nh, T, D) input.
+
+    Per-group (16-element) scale, kept in FP32 (no FP8 rounding). No
+    per-tensor global scale. Scale derivation per group:
+
+        scale         = amax(|group|) / FP4_MAX
+        x_fp4         = round_fp4(clamp(x / scale, -6, 6))
+        x_dequantized = x_fp4 * scale
+
+    All-zero groups (amax == 0) are passed through unchanged: we divide
+    by a placeholder 1.0 to avoid 0/0, then multiply the rounded result
+    by the ORIGINAL (zero) scale, so the output is exactly zero.
+    """
+    B, nh, T, D = data.shape
+    G = _NVFP4_PLUS_GROUP_SIZE
+    assert D % G == 0, f"head_dim {D} must be divisible by NVFP4+ group_size {G}"
+    num_groups = D // G
+
+    grouped = data.view(B, nh, T, num_groups, G).to(torch.float32)
+
+    # per-group fp32 scale = amax / FP4_MAX. No FP8 round.
+    amax = grouped.abs().amax(dim=-1, keepdim=True)
+    scale = amax * (1.0 / _FP4_MAX)
+
+    # Avoid 0/0 for all-zero groups by quantizing with a safe scale, then
+    # dequantizing with the original (possibly-zero) scale so zero groups
+    # stay exactly zero.
+    scale_safe = torch.where(scale == 0, torch.ones_like(scale), scale)
+    scaled = grouped / scale_safe
+    scaled = scaled.clamp(min=-_FP4_MAX, max=_FP4_MAX)
+    fp4 = _round_to_fp4_e2m1(scaled)
+
+    out = (fp4 * scale).view(B, nh, T, D)
+    # As in NVFP4: do NOT sanitize NaN/Inf — real KV-cache values never
+    # contain NaN/Inf during normal inference; surfacing the failure is
+    # preferable to masking it.
+    return out.to(data.dtype)
+
+
+@_fake_quantize_dequantize_nvfp4_plus.register_fake
+def _fake_quantize_dequantize_nvfp4_plus_meta(data: torch.Tensor) -> torch.Tensor:
+    return torch.empty_like(data)
+
+
+def fake_quantize_nvfp4_plus(
+    x: torch.Tensor, num_kv_heads: int, head_dim: int,
+) -> torch.Tensor:
+    """NVFP4+ round-trip with reshape into the canonical layout.
+
+    No ``global_scale`` argument — per-group FP32 scale is computed on the
+    fly inside the kernel, so no calibration ``.pt`` is needed.
+    """
+    orig_shape = x.shape
+    orig_dtype = x.dtype
+    x4 = _to_bnhtd(x, num_kv_heads, head_dim)
+    out = torch.ops.vllm_kv_quant.fake_quantize_dequantize_nvfp4_plus(x4)
     return _from_bnhtd(out, orig_shape).to(orig_dtype)

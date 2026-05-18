@@ -21,7 +21,7 @@ import torch.nn as nn
 from vllm.config import KVCacheQuantConfig, get_current_vllm_config_or_none
 from vllm.logger import init_logger
 
-from .kernels import fake_quantize_nvfp4
+from .kernels import fake_quantize_nvfp4, fake_quantize_nvfp4_plus
 
 logger = init_logger(__name__)
 
@@ -31,31 +31,35 @@ logger = init_logger(__name__)
 # ---------------------------------------------------------------------------
 
 class LayerKVQuantState(nn.Module):
-    """Per-Attention-layer NVFP4 KV-quant state.
+    """Per-Attention-layer KV-quant state.
 
-    Subclassing ``nn.Module`` (rather than using a plain dataclass) makes the
-    per-layer global-scale buffers auto-migrate with the parent's
+    Subclassing ``nn.Module`` (rather than using a plain dataclass) makes any
+    per-layer scale buffers auto-migrate with the parent's
     ``module.to(device)``.
 
     Attributes:
-        method: Currently always ``"nvfp4"``. Stored for potential future
-            multi-method dispatch.
+        method: ``"nvfp4"`` or ``"nvfp4_plus"``.
         gs_k / gs_v: NVFP4 per-tensor (per-layer) FP32 global scales,
-            registered as non-persistent buffers.
+            registered as non-persistent buffers. ``None`` for
+            ``method="nvfp4_plus"`` (which has no global scale — per-group
+            FP32 scale is computed dynamically inside the kernel).
     """
 
     def __init__(
         self,
         method: str,
-        gs_k: torch.Tensor,
-        gs_v: torch.Tensor,
+        gs_k: torch.Tensor | None = None,
+        gs_v: torch.Tensor | None = None,
     ) -> None:
         super().__init__()
         self.method = method
-        # Non-persistent buffers auto-migrate with module.to(device); won't be
-        # saved with state_dict.
-        self.register_buffer("gs_k", gs_k, persistent=False)
-        self.register_buffer("gs_v", gs_v, persistent=False)
+        # Only register the buffers for methods that actually carry per-layer
+        # state. Non-persistent buffers auto-migrate with module.to(device)
+        # and won't be saved with state_dict.
+        if gs_k is not None:
+            self.register_buffer("gs_k", gs_k, persistent=False)
+        if gs_v is not None:
+            self.register_buffer("gs_v", gs_v, persistent=False)
 
 
 # ---------------------------------------------------------------------------
@@ -116,12 +120,21 @@ def attach_kv_quant_to_layer(layer, prefix: str) -> None:
     if cfg is None:
         return
 
-    gs_k, gs_v = _resolve_nvfp4_global_scales(layer, prefix, cfg)
-    layer.kv_quant_state = LayerKVQuantState(
-        method=cfg.method,
-        gs_k=gs_k,
-        gs_v=gs_v,
-    )
+    if cfg.method == "nvfp4":
+        gs_k, gs_v = _resolve_nvfp4_global_scales(layer, prefix, cfg)
+        layer.kv_quant_state = LayerKVQuantState(
+            method=cfg.method, gs_k=gs_k, gs_v=gs_v,
+        )
+    elif cfg.method == "nvfp4_plus":
+        # No per-layer state; the kernel computes per-group FP32 scale on
+        # the fly. Still attach a state object so the Attention.forward
+        # ``getattr(self, "kv_quant_state", None)`` branch fires.
+        layer.kv_quant_state = LayerKVQuantState(method=cfg.method)
+    else:
+        raise ValueError(
+            f"[kv_fake_quant] unknown method {cfg.method!r}; "
+            f"expected 'nvfp4' or 'nvfp4_plus'"
+        )
 
 
 def _resolve_nvfp4_global_scales(
@@ -161,17 +174,24 @@ def _resolve_nvfp4_global_scales(
 def apply_kv_quant(
     layer, key: torch.Tensor, value: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return NVFP4 fake-quantized ``(K, V)``.
+    """Return fake-quantized ``(K, V)``.
 
-    Reads ``layer.kv_quant_state`` for the per-layer global scales.
+    Dispatches on ``layer.kv_quant_state.method``:
+      * ``"nvfp4"``       — per-tensor FP32 global × per-group FP8 × FP4
+      * ``"nvfp4_plus"``  — per-group FP32 × FP4 (no global scale)
     """
     state: LayerKVQuantState = layer.kv_quant_state
-    if state.method != "nvfp4":
-        raise ValueError(
-            f"Only method='nvfp4' is supported; got {state.method!r}"
-        )
     nh = layer.num_kv_heads
     hd = layer.head_size
-    key = fake_quantize_nvfp4(key, nh, hd, state.gs_k)
-    value = fake_quantize_nvfp4(value, nh, hd, state.gs_v)
+    if state.method == "nvfp4":
+        key = fake_quantize_nvfp4(key, nh, hd, state.gs_k)
+        value = fake_quantize_nvfp4(value, nh, hd, state.gs_v)
+    elif state.method == "nvfp4_plus":
+        key = fake_quantize_nvfp4_plus(key, nh, hd)
+        value = fake_quantize_nvfp4_plus(value, nh, hd)
+    else:
+        raise ValueError(
+            f"Unknown KV-quant method {state.method!r}; "
+            f"expected 'nvfp4' or 'nvfp4_plus'"
+        )
     return key, value

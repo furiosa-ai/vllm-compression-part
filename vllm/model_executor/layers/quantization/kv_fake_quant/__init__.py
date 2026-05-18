@@ -37,7 +37,7 @@ Public API (re-exported below):
     fake_quantize_nvfp4                             direct test/utility access
 """
 
-from .kernels import fake_quantize_nvfp4
+from .kernels import fake_quantize_nvfp4, fake_quantize_nvfp4_plus
 from .layer_hooks import (
     LayerKVQuantState,
     apply_kv_quant,
@@ -49,4 +49,5 @@ __all__ = [
     "apply_kv_quant",
     "LayerKVQuantState",
     "fake_quantize_nvfp4",
+    "fake_quantize_nvfp4_plus",
 ]
