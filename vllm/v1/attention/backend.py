@@ -180,6 +180,16 @@ class AttentionBackend(ABC):
         return False
 
     @classmethod
+    def supports_skip_softmax(cls) -> bool:
+        """Whether this backend accepts the skip-softmax threshold kwargs.
+
+        Backends returning True must accept
+        ``skip_softmax_threshold_scale_factor_prefill`` and
+        ``skip_softmax_threshold_scale_factor_decode`` in their impl __init__.
+        """
+        return False
+
+    @classmethod
     def supports_mm_prefix(cls) -> bool:
         return False
 

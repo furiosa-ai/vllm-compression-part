@@ -351,6 +351,10 @@ class FlashInferBackend(AttentionBackend):
         return [64, 128, 256]
 
     @classmethod
+    def supports_skip_softmax(cls) -> bool:
+        return True
+
+    @classmethod
     def supports_compute_capability(cls, capability: DeviceCapability) -> bool:
         return capability >= DeviceCapability(7, 5) and capability <= DeviceCapability(
             12, 1
