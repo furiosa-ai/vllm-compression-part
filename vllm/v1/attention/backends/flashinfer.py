@@ -1143,7 +1143,15 @@ class FlashInferImpl(AttentionImpl):
         attn_type: AttentionType = AttentionType.DECODER,
         kv_sharing_target_layer_name: int | None = None,
         sinks: torch.Tensor | None = None,
+        skip_softmax_threshold_scale_factor_prefill: float | None = None,
+        skip_softmax_threshold_scale_factor_decode: float | None = None,
     ) -> None:
+        self.skip_softmax_threshold_scale_factor_prefill: float | None = (
+            skip_softmax_threshold_scale_factor_prefill
+        )
+        self.skip_softmax_threshold_scale_factor_decode: float | None = (
+            skip_softmax_threshold_scale_factor_decode
+        )
         self.num_heads = num_heads
         self.head_size = head_size
         self.scale = float(scale)
@@ -1462,6 +1470,7 @@ class FlashInferImpl(AttentionImpl):
                     sinks=self.sinks,
                     o_sf_scale=self.o_sf_scale,
                     out=out,
+                    skip_softmax_threshold_scale_factor=self.skip_softmax_threshold_scale_factor_prefill,
                 )
 
         if num_decode_tokens > 0:
@@ -1561,6 +1570,7 @@ class FlashInferImpl(AttentionImpl):
                     o_sf_scale=self.o_sf_scale,
                     out=out,
                     q_len_per_req=q_len_per_req,
+                    skip_softmax_threshold_scale_factor=self.skip_softmax_threshold_scale_factor_decode,
                 )
         return output_padded
 
