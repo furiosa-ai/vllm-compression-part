@@ -271,6 +271,18 @@ class Attention(nn.Module, AttentionLayerBase):
             )
             cache_config.enable_prefix_caching = False
 
+        # skip-softmax sparsity (arxiv 2512.12087): forward the per-phase
+        # threshold scale factors to backends that support it (FlashInfer TRTLLM).
+        # Reuses the vllm_config obtained above; same pattern as use_alibi_sqrt.
+        if self.attn_backend.supports_skip_softmax():
+            ac = vllm_config.attention_config
+            extra_impl_args["skip_softmax_threshold_scale_factor_prefill"] = (
+                ac.skip_softmax_threshold_scale_factor_prefill
+            )
+            extra_impl_args["skip_softmax_threshold_scale_factor_decode"] = (
+                ac.skip_softmax_threshold_scale_factor_decode
+            )
+
         impl_cls = self.attn_backend.get_impl_cls()
         self.impl = impl_cls(
             num_heads,
