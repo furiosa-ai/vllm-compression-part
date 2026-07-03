@@ -578,7 +578,7 @@ def _test_backend_correctness(
         "single_prefill",
     ],
 )
-@pytest.mark.parametrize("model", ["meta-llama/Meta-Llama-3-8B"])
+@pytest.mark.parametrize("model", ["Qwen/Qwen3-0.6B"])
 @pytest.mark.parametrize("tensor_parallel_size", [1, 2, 4])
 @pytest.mark.parametrize(
     ("skip_softmax_threshold_prefill", "skip_softmax_threshold_decode"),
