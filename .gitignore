@@ -238,3 +238,8 @@ ep_kernels_workspace/
 vllm/grpc/vllm_engine_pb2.py
 vllm/grpc/vllm_engine_pb2_grpc.py
 vllm/grpc/vllm_engine_pb2.pyi
+
+# Skip-softmax calibration outputs and RULER sample cache are generated
+# artifacts (produced by tools/calibrate_skip_softmax.py --out/--cache-dir).
+# Keep them on disk for reuse, but never track them in the fork source tree.
+calibration/
