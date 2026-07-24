@@ -194,6 +194,174 @@ def main() -> int:
 
     config = {"sparse_cfg": sparse_cfg}
 
+    # ----------------------------------------------------------------------------------
+    # GROUP-CONSENSUS PATCH (GQA-aware sparsity measurement)
+    #
+    # WHY: the modelopt-0.45 `flash_skip_softmax` calibrator decides skips INDEPENDENTLY
+    # PER QUERY HEAD and reports the per-head mean sparsity. The deployed FlashInfer
+    # kernel (fmha_v2/trtllm_gen) skips a KV tile only by a UNANIMOUS vote across the
+    # whole GQA group (__all_sync + atomicAnd(skip_softmax_vote), verified in
+    # flashinfer 0.6.8.post1 csrc/fmha_v2/fmha/warpspec/epilogue.h): a tile is skipped
+    # only if EVERY query head sharing that KV read votes to skip. So per-head calibration
+    # fits SF to an upper bound the fused kernel cannot realize, and calibrated targets
+    # under-deliver as *group* sparsity.
+    #
+    # FIX: reduce the per-head KEEP mask group-wise (a KV tile is KEPT if ANY head in the
+    # group keeps it == OR over the group) before counting, and divide by num_kv_heads.
+    # This makes stats["sparsity"] the group-consensus sparsity the kernel realizes, so
+    # the fitted (a,b) map GROUP-sparsity -> SF. No-op for MHA (rep == 1).
+    #
+    # Applied by rebinding the modelopt method (kept in this furiosa-owned driver rather
+    # than editing the pip-installed package). num_kv_heads is bound from the model config
+    # via closure BEFORE sparsify(), because calibration runs INSIDE sparsify() — setting
+    # it on the modules afterwards would be too late. block_mask is kept per-head and the
+    # group OR-reduction is applied only to the sparsity COUNT, so the per-head
+    # element_mask path can never shape-mismatch.
+    # ----------------------------------------------------------------------------------
+    import numpy as _np
+    import math as _math
+    from modelopt.torch.sparsity.attention_sparsity.methods.flash_skip_softmax import (
+        FlashSkipSoftmax as _FSS,
+    )
+
+    _NKV = int(getattr(model.config, "num_key_value_heads", 0) or 0)
+    _NQH = int(getattr(model.config, "num_attention_heads", 0) or 0)
+    print(
+        f"[patch] group-consensus: num_kv_heads={_NKV} num_attention_heads={_NQH} "
+        f"rep={(_NQH // _NKV) if _NKV else 'n/a'} (rep==1 => MHA no-op)"
+    )
+
+    def _patched_calc(self, attn_weights, phase):  # noqa: C901  (faithful copy of 0.45 body)
+        batch_size, num_heads, seq_q, seq_k = attn_weights.shape
+
+        # --- group-consensus helper (GQA-aware) ---
+        num_kv_heads = _NKV or num_heads
+        rep = max(num_heads // num_kv_heads, 1)  # GQA group size; 1 == MHA (no-op)
+
+        def _group_keep(keep):
+            # keep: per-head KEEP mask [B, Hq, ...] -> group KEEP [B, Hkv, ...] via OR
+            # over the rep heads that share one KV read (contiguous, repeat_kv order:
+            # q-head = kv_idx*rep + r). A KV tile is kept if ANY head in the group keeps it.
+            return keep if rep == 1 else keep.unflatten(1, (num_kv_heads, rep)).any(dim=2)
+
+        calibration_params = self.calibration_params
+        target_sparse_ratio = self.target_sparse_ratio
+        use_calibration_params = (
+            calibration_params is not None
+            and phase in calibration_params
+            and target_sparse_ratio is not None
+        )
+
+        if use_calibration_params:
+            a = calibration_params[phase]["a"]
+            b = calibration_params[phase]["b"]
+            target_sparsity = target_sparse_ratio.get(phase, 0.5)
+            scale_factor = a * _np.exp(b * target_sparsity)
+            log_thresholds = [_np.log(scale_factor / seq_k)]
+        else:
+            log_thresholds = [_np.log(t) for t in self.thresholds]
+
+        if phase == "prefill":
+            blocked_attn, num_block_rows, num_block_cols, padded_seq_q, padded_seq_k = (
+                self._reshape_to_blocks(attn_weights, self.br, self.bc)
+            )
+            block_max = blocked_attn.max(dim=-1)[0]
+            del blocked_attn
+            block_max_cummax = block_max.cummax(dim=-1)[0]
+
+            block_max_larger = torch.ones_like(block_max)
+            block_max_larger[..., 1:] = block_max[..., 1:] > block_max_cummax[..., :-1]
+            correction_factor = (block_max_larger.sum() / block_max_larger.numel()).item()
+            del block_max_larger
+
+            if self.is_causal:
+                num_causal_blocks = num_block_rows * (2 * num_block_cols - num_block_rows + 1) // 2
+                total_valid_blocks = batch_size * num_kv_heads * num_causal_blocks  # group-wise
+                total_blocks = num_causal_blocks
+            else:
+                total_valid_blocks = batch_size * num_kv_heads * num_block_rows * num_block_cols
+                total_blocks = num_block_rows * num_block_cols
+
+            dense_blocks_list = []
+            block_mask_0 = None
+            block_diff = block_max - block_max_cummax
+            for i, log_threshold in enumerate(log_thresholds):
+                block_mask = (block_diff > log_threshold).any(dim=-2)  # per-head KEEP
+                dense_blocks_list.append(_group_keep(block_mask).sum().item())  # group count
+                if i == 0 and not self._calibration_mode:
+                    block_mask_0 = block_mask
+                del block_mask
+
+            del block_max, block_max_cummax
+
+            if not self._calibration_mode and block_mask_0 is not None:
+                element_mask = (
+                    block_mask_0.unsqueeze(-2)
+                    .unsqueeze(-1)
+                    .expand(batch_size, num_heads, num_block_rows, self.br, num_block_cols, self.bc)
+                )
+                del block_mask_0
+                element_mask = element_mask.reshape(
+                    batch_size, num_heads, padded_seq_q, padded_seq_k
+                )
+                element_mask = element_mask[:, :, :seq_q, :seq_k]
+            else:
+                element_mask = None
+
+        else:  # decode
+            blocked_attn, _, num_block_cols, _, padded_seq_k = self._reshape_to_blocks(
+                attn_weights, 1, self.bc
+            )
+            block_max = blocked_attn.max(dim=-1)[0]
+            del blocked_attn
+            block_max_cummax = block_max.cummax(dim=-1)[0]
+
+            block_max_larger = torch.ones_like(block_max)
+            block_max_larger[..., 1:] = block_max[..., 1:] > block_max_cummax[..., :-1]
+            correction_factor = (block_max_larger.sum() / block_max_larger.numel()).item()
+            del block_max_larger
+
+            total_valid_blocks = batch_size * num_kv_heads * num_block_cols  # group-wise
+            total_blocks = num_block_cols
+
+            dense_blocks_list = []
+            block_mask_0 = None
+            for i, log_threshold in enumerate(log_thresholds):
+                block_mask = block_max - block_max_cummax > log_threshold  # per-head KEEP
+                dense_blocks_list.append(_group_keep(block_mask).sum().item())  # group count
+                if i == 0 and not self._calibration_mode:
+                    block_mask_0 = block_mask
+                del block_mask
+
+            del block_max, block_max_cummax
+
+            if not self._calibration_mode and block_mask_0 is not None:
+                element_mask = block_mask_0[..., None].expand(
+                    batch_size, num_heads, 1, 1, num_block_cols, self.bc
+                )
+                del block_mask_0
+                element_mask = element_mask.reshape(batch_size, num_heads, 1, padded_seq_k)
+                element_mask = element_mask[:, :, :seq_q, :seq_k]
+            else:
+                element_mask = None
+
+        sparsity_list = [1.0 - d / total_valid_blocks for d in dense_blocks_list]
+        sparsity_out = sparsity_list
+        sparse_blocks_out = [int(s * total_blocks) for s in sparsity_list]
+
+        stats = {
+            "correction_factor": correction_factor,
+            "sparsity": sparsity_out,
+            "phase": phase,
+            "total_blocks": total_blocks,
+            "sparse_blocks": sparse_blocks_out,
+            "sample_length": seq_k,
+        }
+        return element_mask, stats
+
+    _FSS.calc_correction_factor_and_p = _patched_calc
+    print("[patch] rebound FlashSkipSoftmax.calc_correction_factor_and_p (group-consensus)")
+
     print("[calibrate] Starting calibration …")
     t1 = time.time()
     mtsa.sparsify(model, config)
@@ -241,6 +409,15 @@ def main() -> int:
         result["additional_operating_points"][f"target={extra}"] = {
             phase: scale(phase, extra) for phase in params
         }
+
+    result["sparsity_granularity"] = "group_consensus"
+    result["num_kv_heads"] = _NKV
+    result["note"] = (
+        "GROUP-CONSENSUS calibration: sparsity measured GQA-group-wise (a KV tile is "
+        "kept if ANY head in the group keeps it) to match the served FlashInfer kernel's "
+        "unanimous skip vote. SFs differ from (are larger than) per-head calibration. "
+        "Report accuracy vs realized (block-count) group sparsity."
+    )
 
     out_path.write_text(json.dumps(result, indent=2))
     print(f"[calibrate] Wrote {out_path}")
